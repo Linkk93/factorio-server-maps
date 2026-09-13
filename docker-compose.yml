@@ -12,8 +12,8 @@
 #   /instance            full AMP instance dir, read-only
 #   /cache               version-keyed Factorio client cache (named volume)
 #   /output              host bind (OUTPUT_DIR_HOST) — what Caddy serves
-#   /run                 tmpfs; the runtime-written credentials netrc
-#                        (0600, later task) never touches the writable layer
+#   /run                 tmpfs; the runtime-written download credentials
+#                        (curl config, 0600) never touch the writable layer
 
 services:
   mapshot:
@@ -39,8 +39,9 @@ services:
       # Full Factorio clients (~1-2 GB each), keyed by version+edition.
       - factorio-clients:/cache
     tmpfs:
-      # Credentials netrc is written here at runtime (mode 0600) and deleted
-      # again — never in the image layer or on persistent disk.
+      # Download credentials (a curl config carrying the authenticated URL)
+      # are written here at runtime (mode 0600) and deleted again — never in
+      # the image layer or on persistent disk.
       - /run
     # Optional CPU ceiling: llvmpipe otherwise runs ~one thread per core for
     # hours. Uncomment to bound contention with the live game server (also

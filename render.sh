@@ -27,6 +27,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -
 # can point version detection and client caching at fixture trees.
 INSTANCE_DIR="${INSTANCE_DIR:-/instance}"
 CACHE_DIR="${CACHE_DIR:-/cache}"
+# /run contract (docker compose tmpfs): the runtime-written curl config that
+# carries the download credentials (mode 0600) must live on tmpfs, never on
+# the writable layer or persistent disk. Honors the environment so host-side
+# tests can point it at a writable directory.
+RUN_DIR="${RUN_DIR:-/run}"
 # /output contract (the docker compose bind of OUTPUT_DIR_HOST): renders/,
 # .staging/ scratch, .render.lock and the latest symlink all live here.
 # Co-locating staging and final output on one filesystem is what makes
@@ -88,7 +93,9 @@ load_config() {
 	AMP_INSTANCE_NAME="${AMP_INSTANCE_NAME:-}"
 	SAVE_NAME="${SAVE_NAME:-}"
 	FACTORIO_VERSION="${FACTORIO_VERSION:-}"
-	FACTORIO_EDITION="${FACTORIO_EDITION:-alpha}"
+	# Empty = auto-detect from the instance's mod-list.json (see
+	# resolve_edition); "alpha" | "expansion" force an edition.
+	FACTORIO_EDITION="${FACTORIO_EDITION:-}"
 	FACTORIO_USERNAME="${FACTORIO_USERNAME:-}"
 	FACTORIO_TOKEN="${FACTORIO_TOKEN:-}"
 	MAPSHOT_AREA="${MAPSHOT_AREA:-entities}"
@@ -187,6 +194,58 @@ detect_version() {
 	return 1
 }
 
+# resolve_edition: print (stdout) the download edition to use, "alpha" or
+# "expansion"; all diagnostics go to stderr so the stdout contract survives
+# `$( ... )` capture. Order: (a) FACTORIO_EDITION override (alpha|expansion)
+# → (b) the instance's mods/mod-list.json: an enabled "space-age" mod entry
+# means the save needs the Space Age client ("expansion"), anything else
+# renders with "alpha" (per https://wiki.factorio.com/Download_API, alpha =
+# full build WITHOUT Space Age, expansion = WITH). A missing mod-list.json
+# defaults to alpha with a warning — prepare_sandbox still fatals on a
+# missing mod-list.json later, so nothing is silently accepted here.
+resolve_edition() {
+	if [[ -n "${FACTORIO_EDITION:-}" ]]; then
+		case "${FACTORIO_EDITION}" in
+			alpha | expansion)
+				info "Factorio edition: ${FACTORIO_EDITION} (source: FACTORIO_EDITION override)" >&2
+				printf '%s\n' "${FACTORIO_EDITION}"
+				return 0
+				;;
+			*)
+				warn "FACTORIO_EDITION='${FACTORIO_EDITION}' is not alpha|expansion — ignoring it and auto-detecting" >&2
+				;;
+		esac
+	fi
+
+	local mod_list="${INSTANCE_DIR}/mods/mod-list.json"
+	if [[ ! -f "${mod_list}" ]]; then
+		warn "${mod_list}: not found — cannot auto-detect the edition, defaulting to alpha" >&2
+		printf 'alpha\n'
+		return 0
+	fi
+
+	# The probe pairs each {...} object with its own fields, so it works for
+	# both pretty-printed and minified mod-list.json and requires enabled:true
+	# on the same object that carries the space-age name.
+	if awk '
+		{
+			line = $0
+			while (match(line, /\{[^{}]*\}/)) {
+				obj = substr(line, RSTART, RLENGTH)
+				line = substr(line, RSTART + RLENGTH)
+				if (obj ~ /"name"[ \t]*:[ \t]*"space-age"/ && obj ~ /"enabled"[ \t]*:[ \t]*true/) { found = 1; exit }
+			}
+		}
+		END { exit found ? 0 : 1 }
+	' "${mod_list}"; then
+		info "Factorio edition: expansion (source: enabled space-age mod in ${mod_list})" >&2
+		printf 'expansion\n'
+	else
+		info "Factorio edition: alpha (source: no enabled space-age mod in ${mod_list})" >&2
+		printf 'alpha\n'
+	fi
+}
+
 cmd_check() {
 	load_config
 
@@ -207,7 +266,7 @@ cmd_check() {
 	printf '%-24s %s\n' 'instance dir (host)' "${instance_dir}"
 	printf '%-24s %s\n' 'SAVE_NAME' "${SAVE_NAME:-<empty: newest stable save>}"
 	printf '%-24s %s\n' 'FACTORIO_VERSION' "${FACTORIO_VERSION:-<empty: auto-detect>}"
-	printf '%-24s %s\n' 'FACTORIO_EDITION' "${FACTORIO_EDITION}"
+	printf '%-24s %s\n' 'FACTORIO_EDITION' "${FACTORIO_EDITION:-<empty: auto-detect (space-age mod)>}"
 	# Credentials are never printed — only whether they are present.
 	local username_state token_state
 	if [[ -n "${FACTORIO_USERNAME}" ]]; then username_state='(set)'; else username_state='(unset)'; fi
@@ -384,27 +443,62 @@ prune_client_cache() {
 	done
 }
 
-# _FM_TMPDIR / _FM_NETRC: the temp paths of a running ensure_factorio
+# _FM_TMPDIR / _FM_CURLCFG: the temp paths of a running ensure_factorio
 # download, kept as GLOBALS on purpose. ensure_factorio runs inside a
 # command-substitution subshell; by the time its EXIT trap fires, the
 # function has returned and its locals are destroyed — a trap referencing
 # them would hit set -u unbound-variable errors. The trap below therefore
 # reads these globals instead.
 _FM_TMPDIR=''
-_FM_NETRC=''
+_FM_CURLCFG=''
 
 # factorio_dl_cleanup: EXIT-trap backstop for ensure_factorio's download
-# arm — wipes the credentials netrc and the partial download tree on any
-# abort. Runs inside the same subshell, so it only ever touches these
+# arm — wipes the credentials curl config and the partial download tree on
+# any abort. Runs inside the same subshell, so it only ever touches these
 # globals; the parent shell's trap chain is untouched.
 factorio_dl_cleanup() {
 	trap - EXIT
-	if [[ -n "${_FM_NETRC}" ]]; then
-		rm -f -- "${_FM_NETRC}"
+	if [[ -n "${_FM_CURLCFG}" ]]; then
+		rm -f -- "${_FM_CURLCFG}"
 	fi
 	if [[ -n "${_FM_TMPDIR}" ]]; then
 		rm -rf -- "${_FM_TMPDIR}"
 	fi
+}
+
+# factorio_dl_attempt <version> <edition> <outfile>: download one get-download
+# tarball. factorio.com's download endpoint rejects HTTP basic auth and takes
+# the credentials as username/token QUERY PARAMETERS
+# (https://wiki.factorio.com/Download_API). The full authenticated URL is
+# therefore written into the 0600 curl config on tmpfs (curl reads it via
+# -K), so the token never appears in argv, command lines or logs — only in
+# that file — and only the redacted base URL is ever logged. Returns curl's
+# exit code: 22 = HTTP error via -f (e.g. 403/404 for pruned versions),
+# anything else = network/tooling error.
+factorio_dl_attempt() {
+	local version="${1:?usage: factorio_dl_attempt <version> <edition> <outfile>}"
+	local edition="${2:?usage: factorio_dl_attempt <version> <edition> <outfile>}"
+	local out="${3:?usage: factorio_dl_attempt <version> <edition> <outfile>}"
+
+	local base_url="https://factorio.com/get-download/${version}/${edition}/linux64"
+
+	# curl config: write to a 0600 temp file, then rename into place, so the
+	# credentials are never readable by anyone else, not even briefly.
+	local cfg_tmp
+	if ! cfg_tmp="$(mktemp "${RUN_DIR}/factorio.curlcfg.XXXXXX")"; then
+		err 'cannot create a curl config temp file under /run (tmpfs)'
+		return 1
+	fi
+	if ! { printf 'url = "%s?username=%s&token=%s"\n' "${base_url}" "${FACTORIO_USERNAME}" "${FACTORIO_TOKEN}" >"${cfg_tmp}" \
+		&& chmod 0600 "${cfg_tmp}" && mv -f -- "${cfg_tmp}" "${_FM_CURLCFG}"; } then
+		rm -f -- "${cfg_tmp}"
+		err 'cannot install the factorio.com curl config'
+		return 1
+	fi
+
+	# -K: curl takes the URL (credentials included) from the config file, so
+	# no argument ever carries the token. --max-time bounds a stuck transfer.
+	curl -sS -fL --max-time 3600 -K "${_FM_CURLCFG}" -o "${out}"
 }
 
 # ensure_factorio <version> <edition>: print (stdout) the path of a working
@@ -412,11 +506,15 @@ factorio_dl_cleanup() {
 # contract survives `$( ... )` capture. Cache hit: <CACHE_DIR>/factorio/
 # <version>-<edition>/bin/x64/factorio whose --version matches — no network.
 # Miss: download https://factorio.com/get-download/<version>/<edition>/linux64
-# using a 0600 netrc under /run (credentials never appear in argv or logs),
-# extract, verify (--version >= <version> via ver_ge), atomically rename into
-# place. Cache GC (prune_client_cache) runs once per render, on cmd_render's
-# success path. Returns 1 on failure; the netrc and temp tree are wiped by
-# the EXIT trap (factorio_dl_cleanup, via the globals above) on any abort.
+# via a 0600 curl config under /run (credentials never appear in argv or
+# logs — see factorio_dl_attempt), extract, verify (--version >= <version>
+# via ver_ge), atomically rename into place. If the exact version is gone
+# server-side (factorio.com prunes obsolete/experimental builds → HTTP
+# 403/404), retries ONCE with 'latest' for the same edition and fails when
+# that fallback is older than <version> (see below). Cache GC
+# (prune_client_cache) runs once per render, on cmd_render's success path.
+# Returns 1 on failure; the curl config and temp tree are wiped by the EXIT
+# trap (factorio_dl_cleanup, via the globals above) on any abort.
 ensure_factorio() {
 	local version="${1:?usage: ensure_factorio <version> <edition>}"
 	local edition="${2:?usage: ensure_factorio <version> <edition>}"
@@ -457,37 +555,37 @@ ensure_factorio() {
 		return 1
 	fi
 
-	local netrc='/run/factorio.netrc'
 	# Publish the temp paths into the globals the EXIT trap cleans (see
 	# factorio_dl_cleanup above for why locals cannot be used here).
 	_FM_TMPDIR="${tmp_dir}"
-	_FM_NETRC="${netrc}"
+	_FM_CURLCFG="${RUN_DIR}/factorio.curlcfg"
 	# Backstop: on any abort (set -e) or subshell exit, wipe the temp tree and
-	# the netrc — credentials and partial downloads must never linger.
+	# the curl config — credentials and partial downloads must never linger.
 	trap factorio_dl_cleanup EXIT
 
-	# netrc: write to a 0600 temp file, then rename into place, so the
-	# credentials are never readable by anyone else, not even briefly.
-	local netrc_tmp
-	if ! netrc_tmp="$(mktemp /run/factorio.netrc.XXXXXX)"; then
-		err 'cannot create a netrc temp file under /run (tmpfs)'
-		return 1
-	fi
-	if ! { printf 'machine factorio.com login %s password %s\n' "${FACTORIO_USERNAME}" "${FACTORIO_TOKEN}" >"${netrc_tmp}" \
-		&& chmod 0600 "${netrc_tmp}" && mv -f -- "${netrc_tmp}" "${netrc}"; } then
-		rm -f -- "${netrc_tmp}"
-		err 'cannot install the factorio.com netrc'
-		return 1
-	fi
+	local tarball="${tmp_dir}/factorio.tar.xz"
+	local dl_base="https://factorio.com/get-download"
+	local used_fallback='no'
+	local dl_rc=0
 
-	local url="https://factorio.com/get-download/${version}/${edition}/linux64"
-	info "downloading Factorio ${version} (${edition}) from ${url} (this can take a while)" >&2
-	if ! curl -n --netrc-file "${netrc}" -fL -o "${tmp_dir}/factorio.tar.xz" "${url}"; then
-		err "download failed: ${url} — check FACTORIO_USERNAME / FACTORIO_TOKEN and that version ${version} exists for edition '${edition}'"
+	# Exact version first. On an HTTP error (curl -f exit 22 — factorio.com
+	# takes experimental builds down quickly, so exact versions can 403/404
+	# even with valid credentials) retry once with 'latest' for the same
+	# edition. Any other curl exit is a network/tooling error: no retry.
+	info "downloading Factorio ${version} (${edition}) from ${dl_base}/${version}/${edition}/linux64 (this can take a while)" >&2
+	factorio_dl_attempt "${version}" "${edition}" "${tarball}" || dl_rc=$?
+	if (( dl_rc == 22 )); then
+		warn "download of ${version} failed with an HTTP error (obsolete/experimental builds are taken down quickly) — retrying once with 'latest' (${edition})" >&2
+		used_fallback='yes'
+		dl_rc=0   # reset: cmd || dl_rc=$? below only assigns on failure
+		factorio_dl_attempt 'latest' "${edition}" "${tarball}" || dl_rc=$?
+	fi
+	if (( dl_rc != 0 )); then
+		err "download failed (curl exit ${dl_rc}): ${dl_base}/${version}/${edition}/linux64 — check FACTORIO_USERNAME / FACTORIO_TOKEN; if the credentials are fine, exact version ${version} may no longer be published (factorio.com prunes obsolete/experimental builds) — set FACTORIO_VERSION to a downloadable version"
 		return 1
 	fi
-	rm -f -- "${_FM_NETRC}"   # credentials are no longer needed from here on
-	_FM_NETRC=''
+	rm -f -- "${_FM_CURLCFG}"   # credentials are no longer needed from here on
+	_FM_CURLCFG=''
 
 	if ! tar -xJf "${tmp_dir}/factorio.tar.xz" -C "${tmp_dir}" --strip-components=1; then
 		err 'extracting the Factorio client failed — damaged download or missing xz'
@@ -508,9 +606,27 @@ ensure_factorio() {
 	local got_ver
 	got_ver="$(printf '%s\n' "${got}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
 	if [[ -z "${got_ver}" ]] || ! ver_ge "${got_ver}" "${version}"; then
-		err "downloaded client reports version '${got_ver:-<none>}' but >= ${version} is required — check FACTORIO_VERSION and FACTORIO_EDITION"
+		if [[ "${used_fallback}" == 'yes' ]]; then
+			err "exact version ${version} no longer downloadable and latest (${got_ver:-<none>}) is older — update the AMP instance or set FACTORIO_VERSION to a downloadable version"
+		else
+			err "downloaded client reports version '${got_ver:-<none>}' but >= ${version} is required — check FACTORIO_VERSION and FACTORIO_EDITION"
+		fi
 		return 1
 	fi
+	if [[ "${used_fallback}" == 'yes' ]]; then
+		warn "render binary is Factorio ${got_ver}, not the save's ${version} (exact version no longer downloadable) — the render may not match the save exactly" >&2
+		# Cache under the binary's REAL version: the cache-hit check verifies
+		# the cached binary against the directory name, so a 'latest' download
+		# must not masquerade as ${version}.
+		client_dir="${cache_root}/${got_ver}-${edition}"
+		client_bin="${client_dir}/bin/x64/factorio"
+	fi
+
+	# A stale/incomplete dir at the target must go: mv into an existing dir
+	# would nest the fresh install below bin/x64/factorio and corrupt the
+	# cache layout. (A *good* dir never reaches this point — the cache-hit
+	# arm above returns early.)
+	rm -rf -- "${client_dir}"
 
 	# Same filesystem (both under cache_root) → this rename is atomic.
 	if ! mv -- "${tmp_dir}" "${client_dir}"; then
@@ -886,14 +1002,17 @@ cmd_render() {
 	detect_version
 	info "render: Factorio version ${FACTORIO_VERSION_RESOLVED} (source: ${FACTORIO_VERSION_SOURCE})"
 
+	local edition
+	edition="$(resolve_edition)"
+
 	local client_bin
-	client_bin="$(ensure_factorio "${FACTORIO_VERSION_RESOLVED}" "${FACTORIO_EDITION}")"
+	client_bin="$(ensure_factorio "${FACTORIO_VERSION_RESOLVED}" "${edition}")"
 	info "render: Factorio client: ${client_bin}"
 
 	# Staging removal on exit (success or failure). Arming it here is safe:
 	# ensure_factorio ran inside a command-substitution subshell, so its own
-	# EXIT trap (netrc/tmp cleanup) fired and vanished together with that
-	# subshell — it never touched this parent shell's trap chain.
+	# EXIT trap (curl config/tmp cleanup) fired and vanished together with
+	# that subshell — it never touched this parent shell's trap chain.
 	trap render_cleanup EXIT
 
 	local save_zip

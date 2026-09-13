@@ -113,7 +113,7 @@ The rest work out of the box; the most interesting knobs:
 |---|---|---|
 | `OUTPUT_DIR_HOST` | `/srv/factorio-maps` | host dir Caddy serves |
 | `FACTORIO_VERSION` | *(auto)* | override version detection |
-| `FACTORIO_EDITION` | `alpha` | `alpha` or `expansion` (Space Age) |
+| `FACTORIO_EDITION` | *(auto)* | `alpha` (no Space Age) or `expansion` (with); empty auto-detects from the instance's enabled `space-age` mod |
 | `SAVE_NAME` | *(newest)* | pin a specific save instead of the newest |
 | `RENDER_TIMEOUT_SECS` | `21600` (6 h) | hard cap around the render |
 | `RETENTION_COUNT` | `3` | old renders kept |
@@ -269,10 +269,14 @@ the OS partition of the game server.
   `chmod 600`. The Factorio API token is **account-scoped** (there is no
   download-only scope) — if it ever leaks, rotate it on your
   [factorio.com profile](https://factorio.com/profile) and update `.env`.
-- At runtime, credentials exist only in the container env and a **netrc
-  written to a tmpfs** (`/run/factorio.netrc`, mode 0600) that is deleted
-  immediately after the download. They are consumed via `curl -n` and never
-  appear in argv, command lines or logs.
+- At runtime, credentials exist only in the container env and in a **curl
+  config written to a tmpfs** (`/run/factorio.curlcfg`, mode 0600) that is
+  deleted immediately after the download. factorio.com's download endpoint
+  rejects HTTP basic auth and requires the credentials as username/token
+  query parameters, so render.sh puts the full authenticated URL into that
+  0600 file, which curl reads via `-K` — the token never appears in argv,
+  command lines or logs, and the authenticated URL itself is never logged
+  (only the redacted path without the query string).
 - Anyone with docker access on the host can read container env vars
   (`docker inspect`) — acceptable on a single-admin host.
 - The **full AMP instance directory is mounted read-only**. The kernel blocks
@@ -305,7 +309,7 @@ configuration and validates mounts/tools inside the container.
 |---|---|
 | GL/Xvfb errors (`could not initialize GLX`, Xvfb crash) | Software GL is already forced (`LIBGL_ALWAYS_SOFTWARE=1`). Try a different `XVFB_SCREEN` depth (e.g. `1920x1080x16`). Debug with `docker compose run --rm --entrypoint xvfb-run mapshot glxinfo -B` (glxinfo needs the virtual display, hence xvfb-run; expect a llvmpipe renderer). |
 | `cannot determine Factorio version — set FACTORIO_VERSION in .env` | The instance layout hid its version. Set `FACTORIO_VERSION` (e.g. `2.0.28`) in `.env`. |
-| Download fails / wrong version | Check credentials and that the version exists for `FACTORIO_EDITION` (`alpha` vs `expansion`). A 2.1 save cannot render in a 2.0 binary — the detected version must be ≥ the save's. |
+| Download fails / wrong version | Check credentials — but note the exact version may simply no longer be published (factorio.com prunes obsolete/experimental builds). render.sh then retries with `latest` automatically; if even that fallback is older than the save's version, update the AMP instance or set `FACTORIO_VERSION` to a downloadable version. A 2.1 save cannot render in a 2.0 binary. |
 | Save-stability error (`still being written ... 120s`) | The newest autosave is <120 s old (live server may be mid-write). Retry, or pin `SAVE_NAME` in `.env`. |
 | Disk-guard error (`only XGB free ... MIN_FREE_GB`) | Free space on the named mount or lower `MIN_FREE_GB` deliberately. Check `df -h`. |
 | Caddy serves 403/404 | Root path mismatch: snippet root must be `<OUTPUT_DIR_HOST>/latest`; check `OUTPUT_DIR_HOST` in `.env`. |
