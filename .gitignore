@@ -1,0 +1,8 @@
+# Credentials — never commit (contains the factorio.com token).
+.env
+
+# Local render output (in case OUTPUT_DIR_HOST is pointed inside the repo).
+output/
+.staging/
+
+.opencode/

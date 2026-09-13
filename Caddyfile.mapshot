@@ -1,0 +1,116 @@
+# ============================================================================
+# Caddyfile.mapshot — importable Caddy snippet serving the public map viewer.
+#
+# The snippet is named (factorio_maps). It never activates anything by itself;
+# it only takes effect when imported into a site block of your existing
+# Caddyfile (see the integration example at the bottom).
+#
+# Validation after integration (on the server):
+#   caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# --- What it serves ----------------------------------------------------------
+#
+# Root is <OUTPUT_DIR_HOST>/latest (default /srv/factorio-maps/latest — the
+# `latest` symlink render.sh swaps atomically after every render). The URL
+# https://map.example.com/ therefore always shows the newest render.
+#
+# ADJUST THE ROOT if you changed OUTPUT_DIR_HOST in .env: the path below must
+# be "<OUTPUT_DIR_HOST>/latest".
+#
+# Nothing else under the output directory is web-reachable, because the root
+# is latest/: renders/ (old versions), .staging/ (scratch, wiped after every
+# run), .render.lock and .latest.tmp* are all siblings of latest/ and can
+# never be requested. If you want old renders public too, see the optional
+# block at the bottom.
+#
+# --- Caching -----------------------------------------------------------------
+#
+# Everything except tile data gets Cache-Control "no-cache": URLs under
+# latest/ are stable, but their CONTENT changes completely with every
+# render, so browsers must revalidate. That is cheap — file_server answers
+# conditional requests with Last-Modified-based (not ETag) 304 responses.
+# Never put long max-age on these paths.
+#
+# Exception — tile data under d-<hash>/: every render writes its tiles into
+# one d-<hash>/ directory (hash unique to that render), and a fresh render
+# creates a NEW d-<hash>/ rather than touching old ones. Those URLs are
+# content-frozen even though they sit under latest/, so they are cached
+# aggressively (1 year, immutable). index.html / js stay no-cache.
+#
+# --- Compression ---------------------------------------------------------------
+#
+# zstd/gzip are restricted to text-ish types (html/css/js/json + text/*).
+# The map's JPEG tiles are already compressed: compressing them again wastes
+# CPU on the server and shrinks nothing, so jpeg/jpg are explicitly excluded
+# by this Content-Type allowlist.
+#
+# --- Renders ------------------------------------------------------------------
+#
+# The `latest` symlink is swapped via a single atomic rename(2) after each
+# render; Caddy resolves it per request, so new renders are picked up
+# immediately — NO Caddy reload is needed between renders.
+# ============================================================================
+
+(factorio_maps) {
+	root * /srv/factorio-maps/latest
+
+	encode zstd gzip {
+		match {
+			header Content-Type text/*
+			header Content-Type application/json
+			header Content-Type application/javascript
+		}
+	}
+
+	# Mutually exclusive matchers so the two header rules can never both fire
+	# (each request matches exactly one).
+	@tiles path *d-*/*
+	header @tiles Cache-Control "public, max-age=31536000, immutable"
+
+	@notTiles not path *d-*/*
+	header @notTiles Cache-Control "no-cache"
+
+	file_server
+}
+
+# ============================================================================
+# Integration example — how to import this snippet into an existing Caddyfile
+# ============================================================================
+#
+# 1. Copy this file next to your Caddyfile, e.g.:
+#      sudo cp Caddyfile.mapshot /etc/caddy/Caddyfile.mapshot
+#
+# 2. In /etc/caddy/Caddyfile, import it at the top (paths are relative to the
+#    main Caddyfile's directory, so a bare name works for /etc/caddy/):
+#
+#      import Caddyfile.mapshot
+#
+# 3. In the site that should serve the map, import the snippet:
+#
+#      map.example.com {
+#      	import factorio_maps
+#      }
+#
+# 4. Validate and reload:
+#      caddy validate --config /etc/caddy/Caddyfile
+#      sudo systemctl reload caddy
+#
+# ============================================================================
+# OPTIONAL: expose versioned renders with immutable caching
+# ============================================================================
+#
+# By default only latest/ is public. If you later want stable, permanently
+# cacheable URLs for old renders (https://map-archive.example.com/
+# <timestamp>_<save>/index.html), uncomment and adapt — this serves the whole
+# renders/ tree on its OWN host, leaving the snippet above untouched:
+#
+#   map-archive.example.com {
+#   	root * /srv/factorio-maps/renders
+#   	file_server
+#   	header Cache-Control "public, max-age=31536000, immutable"
+#   }
+#
+# (Timestamped render directories are content-frozen once published, so
+# immutable caching is safe there — unlike latest/.)
+# ============================================================================

@@ -1,0 +1,35 @@
+# ============================================================================
+# factorio-mapshot.timer — nightly schedule for factorio-mapshot.service.
+#
+# Install (on the server, after the .service file — full walkthrough in README):
+#   1. sudo cp factorio-mapshot.service factorio-mapshot.timer /etc/systemd/system/
+#   2. sudo systemctl daemon-reload
+#   3. sudo systemctl enable --now factorio-mapshot.timer
+# Check the schedule:  systemctl list-timers factorio-mapshot.timer
+#
+# OnCalendar is the ONE tuning knob outside .env (documented in the README).
+# Nightly at 04:30 server-local time, with a small random delay to avoid a
+# hard strike on the hour.
+#
+# Persistent=true: if the server was off/rebooting at the scheduled time, the
+# missed run is triggered once at the next boot (after docker is up, thanks
+# to the service's After=/Wants= ordering). A failed run is NOT retried —
+# the next nightly fire recovers.
+#
+# Overlap safety: if the timer fires while a manual render is still running
+# (or vice versa), the second run loses the flock inside render.sh and exits
+# 0 immediately with "render already in progress" — concurrent renders are
+# impossible by construction.
+# ============================================================================
+
+[Unit]
+Description=Nightly Factorio mapshot render
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=factorio-mapshot.service
+
+[Install]
+WantedBy=timers.target

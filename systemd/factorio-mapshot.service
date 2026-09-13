@@ -1,0 +1,60 @@
+# ============================================================================
+# factorio-mapshot.service — on-demand/nightly mapshot render of the AMP
+# Factorio instance (paired with factorio-mapshot.timer).
+#
+# Install (on the server, after cloning this repo — full walkthrough in README):
+#   1. EDIT THE REPO PATHS below (WorkingDirectory + ExecStart) if you did not
+#      clone to /opt/factorio-server-maps. Both must point at the cloned repo
+#      (the directory containing docker-compose.yml and .env).
+#   2. sudo cp factorio-mapshot.service factorio-mapshot.timer /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now factorio-mapshot.timer
+# Manual trigger any time:  sudo systemctl start factorio-mapshot
+# Logs:                     journalctl -u factorio-mapshot -f
+#
+# Runs as root deliberately: root always has access to the docker daemon, and
+# the container's root user is what can read the amp-owned instance files.
+#
+# TimeoutStartSec MUST stay >= RENDER_TIMEOUT_SECS (.env, default 21600 s = 6 h)
+# PLUS time for the client download/extraction (~1-2 GB) and the save/mods
+# snapshot. The 12 h default leaves ~6 h headroom. If you raise
+# RENDER_TIMEOUT_SECS in .env toward ~11 h, raise this value to match (and
+# vice versa: TimeoutStartSec firing mid-render kills the container).
+#
+# Deliberately NO Nice=/IOSchedulingClass= here: systemd per-unit CPU/IO
+# scheduling attributes apply to processes directly parented by the unit, but
+# the actual render runs inside a container whose processes are re-parented
+# under the docker-shim cgroup — Nice=/IOSchedulingClass= would only affect
+# the short-lived `docker compose` client and silently do nothing for the
+# render. De-prioritization is applied INSIDE the container by render.sh
+# (`nice -n 19 ionice -c 3` around the mapshot invocation). Do not re-add it.
+#
+# systemctl stop mid-render sends SIGTERM, which the attached `docker
+# compose run` forwards — but bash as the container's PID 1 ignores SIGTERM,
+# so the container only dies when docker's 10 s grace period expires and it
+# SIGKILLs the container. That kill is abrupt: render.sh's EXIT cleanup may
+# not run (the next run wipes /output/.staging). Verify once after install:
+# start a render, stop the unit, confirm `docker ps` shows no mapshot
+# container a few seconds later.
+# ============================================================================
+
+[Unit]
+Description=Factorio mapshot render (AMP instance sidecar)
+# Wants/After ensure that a Persistent=true timer catch-up fire at boot does
+# not race the docker daemon or the network (client download on cache miss).
+Wants=network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+# --- ADJUST: absolute path of the cloned repository on this server ----------
+# (Alternative: replace with %h to use the invoking user's home, i.e. /root
+# on a system unit — only correct if you actually cloned there.)
+WorkingDirectory=/opt/factorio-server-maps
+# --- ADJUST: same path, so compose finds docker-compose.yml and .env --------
+ExecStart=/usr/bin/docker compose -f /opt/factorio-server-maps/docker-compose.yml run --rm mapshot render
+# See header: keep >= RENDER_TIMEOUT_SECS + download/extract time.
+TimeoutStartSec=12h
+
+# No [Install] section on purpose: this oneshot is started by the timer
+# (or manually via `systemctl start factorio-mapshot`), never enabled itself.

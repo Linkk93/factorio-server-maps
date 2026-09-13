@@ -1,0 +1,19 @@
+# Credentials must never enter the build context or image layers.
+.env
+
+# Git metadata is irrelevant to the image.
+.git
+.gitignore
+
+# Docs and host-side orchestration files not needed in the image.
+README*
+Caddyfile.mapshot
+systemd/
+scripts/
+
+# Workspace/agent state never belongs in a build context.
+.opencode/
+
+# Local output artifacts.
+output/
+.staging/

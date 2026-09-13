@@ -1,0 +1,51 @@
+# Factorio mapshot render sidecar.
+#
+# This service intentionally has NO `profiles:` line: the nightly timer and
+# manual runs invoke `docker compose run --rm mapshot render`, and an
+# accidental bare `docker compose up` is harmless — the entrypoint defaults
+# to the `check` subcommand (validates config, prints the resolved table,
+# exits 0). No restart policy is configured, so nothing lingers.
+#
+# Configuration comes exclusively from .env (copy .env.example): compose uses
+# it for the ${...} interpolation below AND passes it into the container via
+# env_file. Fixed container-side paths (contract with render.sh):
+#   /instance            full AMP instance dir, read-only
+#   /cache               version-keyed Factorio client cache (named volume)
+#   /output              host bind (OUTPUT_DIR_HOST) — what Caddy serves
+#   /run                 tmpfs; the runtime-written credentials netrc
+#                        (0600, later task) never touches the writable layer
+
+services:
+  mapshot:
+    build:
+      context: .
+      # The mapshot version pin lives solely in the Dockerfile
+      # (ARG MAPSHOT_VERSION=0.0.28) — do not reintroduce a build-args
+      # override here; bump it in the Dockerfile and rebuild.
+    env_file:
+      - .env
+    volumes:
+      # The FULL AMP instance directory, read-only: saves/, mods/ and the
+      # Factorio data dir (version detection) are all read from /instance.
+      # Read-only at the kernel level — the container cannot corrupt the
+      # live instance. compose interpolates the two vars directly (it cannot
+      # derive intermediate variables); `:?` fails fast when unset/empty.
+      - ${AMP_DATA_ROOT:?}/${AMP_INSTANCE_NAME:?}:/instance:ro
+      # Rendered maps + staging live here; publishing is a same-filesystem
+      # rename. During a render this also briefly holds the sandbox's full
+      # Factorio client copy (~2.5 GB — covered by the MIN_FREE_GB
+      # pre-flight + sandbox reserve). This is the directory Caddy serves.
+      - ${OUTPUT_DIR_HOST:?}:/output
+      # Full Factorio clients (~1-2 GB each), keyed by version+edition.
+      - factorio-clients:/cache
+    tmpfs:
+      # Credentials netrc is written here at runtime (mode 0600) and deleted
+      # again — never in the image layer or on persistent disk.
+      - /run
+    # Optional CPU ceiling: llvmpipe otherwise runs ~one thread per core for
+    # hours. Uncomment to bound contention with the live game server (also
+    # see the LP_NUM_THREADS knob in .env.example):
+    # cpus: "8"
+
+volumes:
+  factorio-clients:
