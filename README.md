@@ -2,8 +2,10 @@
 
 A self-hosted, automatically-updating **public map viewer** for a Factorio
 server (built for Space Exploration + Krastorio 2 on a CubeCoders AMP
-instance). A [mapshot](https://github.com/Palats/mapshot) render container
-runs alongside the live game server as a *sidecar*: every night (or on
+instance). A [mapshot](https://github.com/Linkk93/mapshot) render container
+(a fork of [Palats/mapshot](https://github.com/Palats/mapshot) carrying a
+one-line Factorio 2.1 compatibility fix — see *How updates work*) runs
+alongside the live game server as a *sidecar*: every night (or on
 demand) it snapshots the newest save, renders the explored map with software
 OpenGL, and publishes the result as static files that Caddy serves.
 
@@ -317,6 +319,12 @@ the OS partition of the game server.
 - **mapshot updates** are pinned (`ARG MAPSHOT_VERSION` in the
   `Dockerfile`): bump the version, then run `docker compose build`
   explicitly — `docker compose run` only builds when the image is missing.
+  The pin currently points at the **Linkk93 fork** (`0.0.28-2.1`), not
+  upstream: upstream 0.0.28 declares `factorio_version "2.0"` in the mod's
+  `info.json`, and Factorio 2.1 refuses to load such mods — the fork bumps
+  that one line to `"2.1"` with no other changes. When upstream ships a
+  2.1-capable release, switch the download URL in the `Dockerfile` back to
+  `Palats/mapshot` and bump the pin.
 
 ## Troubleshooting
 

@@ -14,10 +14,14 @@
 
 FROM debian:bookworm
 
-# Pinned mapshot release. NOTE: upstream GitHub tags carry NO "v" prefix
-# (the release for mapshot 0.0.28 lives at .../releases/tag/0.0.28), and the
-# linux-amd64 asset is a single raw binary named "mapshot-linux".
-ARG MAPSHOT_VERSION=0.0.28
+# Pinned mapshot release. Sourced from the Linkk93 fork, NOT upstream
+# Palats/mapshot: upstream's latest (0.0.28, Nov 2025) declares
+# factorio_version "2.0" in mod/info.json and Factorio 2.1 refuses to load
+# such mods; the fork is identical code with that one line bumped to "2.1".
+# Switch the URL back to Palats/mapshot when upstream ships a 2.1-capable
+# release. NOTE: GitHub tags carry NO "v" prefix (upstream convention), and
+# the linux-amd64 asset is a single raw binary named "mapshot-linux".
+ARG MAPSHOT_VERSION=0.0.28-2.1
 
 ENV SDL_AUDIODRIVER=dummy \
     LIBGL_ALWAYS_SOFTWARE=1
@@ -53,7 +57,7 @@ RUN apt-get update \
 # proves the download yielded a working binary (`version` is a mapshot
 # subcommand; upstream has no --version flag).
 RUN curl -fsSL -o /usr/local/bin/mapshot \
-        "https://github.com/Palats/mapshot/releases/download/${MAPSHOT_VERSION}/mapshot-linux" \
+        "https://github.com/Linkk93/mapshot/releases/download/${MAPSHOT_VERSION}/mapshot-linux" \
     && chmod 0755 /usr/local/bin/mapshot \
     && mapshot version
 
