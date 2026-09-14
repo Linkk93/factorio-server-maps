@@ -112,9 +112,10 @@ The rest work out of the box; the most interesting knobs:
 | Variable | Default | Meaning |
 |---|---|---|
 | `OUTPUT_DIR_HOST` | `/srv/factorio-maps` | host dir Caddy serves |
-| `FACTORIO_VERSION` | *(auto)* | override version detection |
+| `FACTORIO_VERSION` | *(auto)* | empty = auto-detect from the instance; a concrete version (e.g. `2.0.28`); or the aliases `experimental`/`stable`, resolved via the factorio.com latest-releases API on every run |
 | `FACTORIO_EDITION` | *(auto)* | `alpha` (no Space Age) or `expansion` (with); empty auto-detects from the instance's enabled `space-age` mod |
 | `SAVE_NAME` | *(newest)* | pin a specific save instead of the newest |
+| `INSTANCE_SAVES_DIR` / `INSTANCE_MODS_DIR` | *(auto)* | in-container path overrides for the instance's `saves/` and `mods/` dirs; empty = auto-discovered (AMP nests them at `<instance>/factorio/server/...` in newer layouts; `mods/` is found via its `mod-list.json`) |
 | `RENDER_TIMEOUT_SECS` | `21600` (6 h) | hard cap around the render |
 | `RETENTION_COUNT` | `3` | old renders kept |
 | `MIN_FREE_GB` | `10` | pre-flight disk floor; render is skipped below it |
@@ -310,6 +311,8 @@ configuration and validates mounts/tools inside the container.
 | GL/Xvfb errors (`could not initialize GLX`, Xvfb crash) | Software GL is already forced (`LIBGL_ALWAYS_SOFTWARE=1`). Try a different `XVFB_SCREEN` depth (e.g. `1920x1080x16`). Debug with `docker compose run --rm --entrypoint xvfb-run mapshot glxinfo -B` (glxinfo needs the virtual display, hence xvfb-run; expect a llvmpipe renderer). |
 | `cannot determine Factorio version — set FACTORIO_VERSION in .env` | The instance layout hid its version. Set `FACTORIO_VERSION` (e.g. `2.0.28`) in `.env`. |
 | Download fails / wrong version | Check credentials — but note the exact version may simply no longer be published (factorio.com prunes obsolete/experimental builds). render.sh then retries with `latest` automatically; if even that fallback is older than the save's version, update the AMP instance or set `FACTORIO_VERSION` to a downloadable version. A 2.1 save cannot render in a 2.0 binary. |
+| `FACTORIO_VERSION=experimental`/`stable` downloaded a new client | Expected: the aliases re-resolve on every run via the factorio.com latest-releases API, so a new upstream build triggers one fresh download automatically; the superseded client dir is pruned by `CLIENT_CACHE_COUNT`. Pin a concrete version to freeze the client. |
+| `no saves directory found under /instance` | AMP nests server data at `<instance>/factorio/server/saves/` in newer layouts; render.sh auto-discovers all known layouts. If discovery still fails, set `INSTANCE_SAVES_DIR` (and `INSTANCE_MODS_DIR`) in `.env` to the in-container path under `/instance`. |
 | Save-stability error (`still being written ... 120s`) | The newest autosave is <120 s old (live server may be mid-write). Retry, or pin `SAVE_NAME` in `.env`. |
 | Disk-guard error (`only XGB free ... MIN_FREE_GB`) | Free space on the named mount or lower `MIN_FREE_GB` deliberately. Check `df -h`. |
 | Caddy serves 403/404 | Root path mismatch: snippet root must be `<OUTPUT_DIR_HOST>/latest`; check `OUTPUT_DIR_HOST` in `.env`. |

@@ -39,6 +39,12 @@ RUN_DIR="${RUN_DIR:-/run}"
 # INSTANCE_DIR/CACHE_DIR so host-side tests can point it at a fixture tree.
 OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 STAGING_ROOT="${OUTPUT_DIR}/.staging"
+# Resolved once per run by resolve_instance_dirs(): AMP nests server data at
+# <instance>/factorio/server/... in newer layouts, so saves/ and mods/ must
+# never be hardcoded. INSTANCE_SAVES_DIR / INSTANCE_MODS_DIR double as env
+# overrides (in-container paths) — see .env.example.
+INSTANCE_SAVES_DIR="${INSTANCE_SAVES_DIR:-}"
+INSTANCE_MODS_DIR="${INSTANCE_MODS_DIR:-}"
 # SANDBOX_DATADIR is both the mapshot --factorio_datadir AND the root of a
 # full portable Factorio client copy (bin/, data/, mods/, saves/): mapshot
 # polls <datadir>/script-output for its done marker, and the portable Linux
@@ -114,14 +120,87 @@ load_config() {
 	RENDER_TIMEOUT_SECS="${RENDER_TIMEOUT_SECS:-21600}"
 }
 
+# resolve_instance_dirs: resolve INSTANCE_SAVES_DIR / INSTANCE_MODS_DIR once
+# per run, logging each resolved path and how it was found. AMP versions nest
+# server data differently (<instance>/saves, <instance>/factorio/saves,
+# <instance>/factorio/server/saves — and likewise for mods), so the order is:
+# explicit env override (fatal when it does not exist / lacks mod-list.json)
+# → the known layout candidates → a bounded find over INSTANCE_DIR (for mods
+# the reliable marker is a mod-list.json inside the dir). Fatals listing
+# every tried path plus the override hint when nothing matches.
+resolve_instance_dirs() {
+	# --- saves -------------------------------------------------------------
+	if [[ -n "${INSTANCE_SAVES_DIR:-}" ]]; then
+		if [[ ! -d "${INSTANCE_SAVES_DIR}" ]]; then
+			fatal "INSTANCE_SAVES_DIR='${INSTANCE_SAVES_DIR}' is set but not a directory (in-container path under ${INSTANCE_DIR}) — fix or unset the override in .env"
+		fi
+		info "saves dir: ${INSTANCE_SAVES_DIR} (source: INSTANCE_SAVES_DIR override)"
+	else
+		local saves_dir='' saves_src='scan' d
+		for d in "${INSTANCE_DIR}/saves" "${INSTANCE_DIR}/factorio/saves" "${INSTANCE_DIR}/factorio/server/saves"; do
+			if [[ -d "${d}" ]]; then
+				saves_dir="${d}"
+				saves_src='layout candidate'
+				break
+			fi
+		done
+		if [[ -z "${saves_dir}" ]]; then
+			saves_dir="$(find "${INSTANCE_DIR}" -maxdepth 5 -type d -name saves -print -quit 2>/dev/null || true)"
+		fi
+		if [[ -z "${saves_dir}" ]]; then
+			fatal "no saves directory found under ${INSTANCE_DIR} — tried ${INSTANCE_DIR}/saves, ${INSTANCE_DIR}/factorio/saves, ${INSTANCE_DIR}/factorio/server/saves plus a depth-5 scan; check AMP_INSTANCE_NAME or set INSTANCE_SAVES_DIR in .env"
+		fi
+		INSTANCE_SAVES_DIR="${saves_dir}"
+		info "saves dir: ${INSTANCE_SAVES_DIR} (source: ${saves_src})"
+	fi
+
+	# --- mods ---------------------------------------------------------------
+	# The reliable marker is mod-list.json inside the dir — a bare directory
+	# named mods is not proof (mapshot/tmp dirs can share the name).
+	if [[ -n "${INSTANCE_MODS_DIR:-}" ]]; then
+		if [[ ! -f "${INSTANCE_MODS_DIR}/mod-list.json" ]]; then
+			fatal "INSTANCE_MODS_DIR='${INSTANCE_MODS_DIR}' is set but contains no mod-list.json (in-container path under ${INSTANCE_DIR}) — fix or unset the override in .env"
+		fi
+		info "mods dir: ${INSTANCE_MODS_DIR} (source: INSTANCE_MODS_DIR override)"
+	else
+		local mods_dir='' mods_src='layout candidate'
+		for d in "${INSTANCE_DIR}/mods" "${INSTANCE_DIR}/factorio/mods" "${INSTANCE_DIR}/factorio/server/mods"; do
+			if [[ -f "${d}/mod-list.json" ]]; then
+				mods_dir="${d}"
+				break
+			fi
+		done
+		if [[ -z "${mods_dir}" ]]; then
+			mods_src='scan'
+			while IFS= read -r d; do
+				if [[ -f "${d}/mod-list.json" ]]; then
+					mods_dir="${d}"
+					break
+				fi
+			done < <(find "${INSTANCE_DIR}" -maxdepth 5 -type d -name mods -print 2>/dev/null)
+		fi
+		if [[ -z "${mods_dir}" ]]; then
+			fatal "no mods directory containing mod-list.json found under ${INSTANCE_DIR} — tried ${INSTANCE_DIR}/mods, ${INSTANCE_DIR}/factorio/mods, ${INSTANCE_DIR}/factorio/server/mods plus a depth-5 scan; check AMP_INSTANCE_NAME or set INSTANCE_MODS_DIR in .env"
+		fi
+		INSTANCE_MODS_DIR="${mods_dir}"
+		info "mods dir: ${INSTANCE_MODS_DIR} (source: ${mods_src})"
+	fi
+}
+
 # instance_info_json: print the path of the instance's Factorio info.json.
-# Canonical AMP layout first, then a bounded find fallback for AMP-version-
-# dependent layouts. Pure file read — no execution, no network. INSTANCE_DIR
-# is honored so tests can point this at a fixture tree.
+# Known AMP layouts first (<instance>/factorio/data/base/info.json, then
+# <instance>/data/base/info.json), then a bounded find fallback for
+# AMP-version-dependent layouts. Pure file read — no execution, no network.
+# INSTANCE_DIR is honored so tests can point this at a fixture tree.
 instance_info_json() {
-	local canonical="${INSTANCE_DIR}/factorio/data/base/info.json"
-	if [[ -f "${canonical}" ]]; then
-		printf '%s\n' "${canonical}"
+	local candidate="${INSTANCE_DIR}/factorio/data/base/info.json"
+	if [[ -f "${candidate}" ]]; then
+		printf '%s\n' "${candidate}"
+		return 0
+	fi
+	candidate="${INSTANCE_DIR}/data/base/info.json"
+	if [[ -f "${candidate}" ]]; then
+		printf '%s\n' "${candidate}"
 		return 0
 	fi
 	local hit=''
@@ -139,18 +218,94 @@ ver_ge() {
 	[[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V)" == "$(printf '%s\n%s\n' "${b}" "${a}")" ]]
 }
 
+# resolve_version_alias <experimental|stable> <edition>: map a FACTORIO_VERSION
+# alias to the current concrete version (stdout) via factorio.com's public
+# latest-releases endpoint (no auth). All diagnostics go to stderr. The API
+# answer is parsed by KEY NAME, never by position: cut the wanted branch
+# object first, then read the edition key inside it — key order inside the
+# branch objects is not part of the contract. Returns 1 (caller fatals) for
+# an unknown alias, curl failure, unparseable JSON, or a missing edition key.
+resolve_version_alias() {
+	local alias_name="${1:?usage: resolve_version_alias <experimental|stable> <edition>}"
+	local edition="${2:?usage: resolve_version_alias <experimental|stable> <edition>}"
+	local branch="${alias_name,,}"
+	case "${branch}" in
+		experimental | stable) ;;
+		*) return 1 ;;
+	esac
+
+	local api_json
+	if ! api_json="$(curl -sS --max-time 30 'https://factorio.com/api/latest-releases')"; then
+		return 1
+	fi
+	if [[ -z "${api_json}" ]]; then
+		return 1
+	fi
+
+	local branch_obj
+	branch_obj="$(printf '%s\n' "${api_json}" | grep -oE "\"${branch}\":\{[^}]*\}" | head -n 1 || true)"
+	if [[ -z "${branch_obj}" ]]; then
+		return 1
+	fi
+
+	local ver
+	ver="$(printf '%s\n' "${branch_obj}" \
+		| grep -oE "\"${edition}\":\"[0-9.]+\"" \
+		| head -n 1 \
+		| sed -E 's/^"[^"]+":"([0-9.]+)"$/\1/' || true)"
+	if [[ -z "${ver}" ]]; then
+		return 1
+	fi
+	printf '%s\n' "${ver}"
+}
+
 # detect_version: resolve the Factorio version into the globals
 # FACTORIO_VERSION_RESOLVED / FACTORIO_VERSION_SOURCE.
 # Order: (a) FACTORIO_VERSION override → (b) the instance's own info.json
 # (pure file read — preferred over executing a host-built binary that may
 # not run under the container's glibc) → (c) any bin/x64/factorio under the
 # instance via --version (last resort). Returns 1 with an actionable error
-# when nothing works. Detection never touches the network.
+# when nothing works. Detection never touches the network — with one
+# exception: a FACTORIO_VERSION alias ("experimental" | "stable",
+# case-insensitive) is resolved to a concrete version via the
+# latest-releases API BEFORE the client cache lookup, so the download URL
+# and the cache key (<version>-<edition>) stay numeric and deterministic.
+# The alias arm also resolves the edition (which never depends on the
+# version) and publishes it in _FM_EDITION_RESOLVED for cmd_render to reuse.
+# A verbatim override must be numeric — everything downstream (cache key,
+# ver_ge verify) would silently break on anything else.
 detect_version() {
 	FACTORIO_VERSION_RESOLVED=''
 	FACTORIO_VERSION_SOURCE=''
+	_FM_EDITION_RESOLVED=''
 
 	if [[ -n "${FACTORIO_VERSION}" ]]; then
+		local lower="${FACTORIO_VERSION,,}"
+		case "${lower}" in
+			experimental | stable)
+				local alias_edition
+				if ! alias_edition="$(resolve_edition)"; then
+					err "cannot resolve FACTORIO_VERSION=${FACTORIO_VERSION} via factorio.com/api/latest-releases — check connectivity or set a concrete version"
+					return 1
+				fi
+				_FM_EDITION_RESOLVED="${alias_edition}"
+				local concrete
+				if ! concrete="$(resolve_version_alias "${lower}" "${alias_edition}")"; then
+					err "cannot resolve FACTORIO_VERSION=${FACTORIO_VERSION} via factorio.com/api/latest-releases — check connectivity or set a concrete version"
+					return 1
+				fi
+				FACTORIO_VERSION_RESOLVED="${concrete}"
+				FACTORIO_VERSION_SOURCE="override (alias ${lower} -> ${concrete})"
+				info "Factorio version: ${FACTORIO_VERSION_RESOLVED} (source: ${FACTORIO_VERSION_SOURCE})"
+				return 0
+				;;
+		esac
+		# Verbatim override. Guard (defense in depth): the value reaches the
+		# cache key, the download URL and ver_ge — all assume numeric x.y.z.
+		if [[ ! "${FACTORIO_VERSION}" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+			err "FACTORIO_VERSION='${FACTORIO_VERSION}' is neither a numeric x.y.z version nor an experimental|stable alias — set a concrete version like 2.0.28 or one of the aliases"
+			return 1
+		fi
 		FACTORIO_VERSION_RESOLVED="${FACTORIO_VERSION}"
 		FACTORIO_VERSION_SOURCE='override'
 		info "Factorio version: ${FACTORIO_VERSION_RESOLVED} (source: ${FACTORIO_VERSION_SOURCE})"
@@ -217,7 +372,10 @@ resolve_edition() {
 		esac
 	fi
 
-	local mod_list="${INSTANCE_DIR}/mods/mod-list.json"
+	# INSTANCE_MODS_DIR is resolved by resolve_instance_dirs before this runs
+	# in every command path; the ${INSTANCE_DIR}/mods fallback keeps direct
+	# host-side calls (e.g. the check alias arm without /instance) working.
+	local mod_list="${INSTANCE_MODS_DIR:-${INSTANCE_DIR}/mods}/mod-list.json"
 	if [[ ! -f "${mod_list}" ]]; then
 		warn "${mod_list}: not found — cannot auto-detect the edition, defaulting to alpha" >&2
 		printf 'alpha\n'
@@ -288,6 +446,20 @@ cmd_check() {
 	printf '%-24s %s\n' 'XVFB_SCREEN' "${XVFB_SCREEN}"
 	printf '%-24s %s\n' 'RENDER_TIMEOUT_SECS' "${RENDER_TIMEOUT_SECS}"
 
+	# --- instance dirs --------------------------------------------------------
+	# Resolves INSTANCE_SAVES_DIR / INSTANCE_MODS_DIR (fatal inside the
+	# container when the instance layout cannot be discovered). Host mode
+	# without /instance skips gracefully, matching the mount-check gating
+	# below — resolution then happens inside the container.
+	printf '\n== instance dirs ==\n'
+	if [[ -d "${INSTANCE_DIR}" ]]; then
+		resolve_instance_dirs
+		printf '%-24s %s\n' 'saves dir' "${INSTANCE_SAVES_DIR}"
+		printf '%-24s %s\n' 'mods dir' "${INSTANCE_MODS_DIR}"
+	else
+		info "${INSTANCE_DIR}: not present — instance dirs are resolved inside the container"
+	fi
+
 	# --- factorio version ----------------------------------------------------
 	# Instance-grounded detection; on the host (no /instance) only the
 	# FACTORIO_VERSION override can resolve, otherwise detection is deferred
@@ -306,19 +478,11 @@ cmd_check() {
 	# --- mounts -----------------------------------------------------------
 	# INSTANCE_DIR only exists inside the container; on the host these checks
 	# are skipped with a visible note (best-effort host hints instead).
+	# saves/mods were already resolved and validated above (resolve_instance_dirs
+	# logs the found paths and fatals with every tried candidate), so only the
+	# output/cache mounts are checked here.
 	printf '\n== mounts ==\n'
 	if [[ -d "${INSTANCE_DIR}" ]]; then
-		if [[ -d "${INSTANCE_DIR}/saves" ]]; then
-			info "${INSTANCE_DIR}/saves: OK"
-		else
-			err "${INSTANCE_DIR}/saves: missing — is AMP_INSTANCE_NAME correct?"
-			failures=1
-		fi
-		if [[ -f "${INSTANCE_DIR}/mods/mod-list.json" ]]; then
-			info "${INSTANCE_DIR}/mods/mod-list.json: OK"
-		else
-			warn "${INSTANCE_DIR}/mods/mod-list.json: not found (the render requires it; fine if this instance is vanilla-configuration-free)"
-		fi
 		if [[ -d "${OUTPUT_DIR}" ]]; then
 			if [[ -w "${OUTPUT_DIR}" ]]; then
 				info "${OUTPUT_DIR}: OK (writable)"
@@ -663,6 +827,13 @@ SAVE_STABILITY_SECS=120
 # (MIN_FREE_GB) and the README (Disk management).
 SANDBOX_CLIENT_RESERVE_GB=3
 
+# Edition resolved as a side effect of detect_version's FACTORIO_VERSION
+# alias arm (an alias needs the edition to pick the right key in the
+# latest-releases API answer; the edition never depends on the version).
+# Set there, read by cmd_render so resolve_edition runs exactly once per
+# render. Always '' when no alias was involved.
+_FM_EDITION_RESOLVED=''
+
 # preflight: concurrency lock, scratch cleanup, disk guards — in that order.
 # The lock fd stays open for the whole process, so the lock is held until
 # exit (flock releases it automatically when the process dies).
@@ -715,17 +886,14 @@ check_free_space() {
 }
 
 # select_save: choose the save to render; prints the absolute path on stdout,
-# logs to stderr. SAVE_NAME wins (exact file in /instance/saves, ".zip"
+# logs to stderr. SAVE_NAME wins (exact file in INSTANCE_SAVES_DIR, ".zip"
 # appended when missing); otherwise the newest *.zip by mtime, ignoring
 # *.tmp.zip (download/save temporaries). The auto pick is only accepted when
 # the file is at least SAVE_STABILITY_SECS old — fail fast otherwise, the
 # live server may still be writing it.
 select_save() {
-	local saves_dir="${INSTANCE_DIR}/saves"
-	if [[ ! -d "${saves_dir}" ]]; then
-		err "${saves_dir}: missing — is AMP_INSTANCE_NAME correct?" >&2
-		return 1
-	fi
+	# Resolved by resolve_instance_dirs (AMP nests saves/ at various depths).
+	local saves_dir="${INSTANCE_SAVES_DIR:?INSTANCE_SAVES_DIR is not resolved — resolve_instance_dirs must run first}"
 
 	local selected=''
 	if [[ -n "${SAVE_NAME}" ]]; then
@@ -785,7 +953,8 @@ check_save_integrity() {
 prepare_sandbox() {
 	local save_zip="${1:?usage: prepare_sandbox <save.zip> <client-binary>}"
 	local client_bin="${2:?usage: prepare_sandbox <save.zip> <client-binary>}"
-	local mods_src="${INSTANCE_DIR}/mods"
+	# Resolved by resolve_instance_dirs (marker: mod-list.json inside the dir).
+	local mods_src="${INSTANCE_MODS_DIR:?INSTANCE_MODS_DIR is not resolved — resolve_instance_dirs must run first}"
 	if [[ ! -f "${mods_src}/mod-list.json" ]]; then
 		err "${mods_src}/mod-list.json: missing — the render needs it even for vanilla saves; check the instance's mods/ directory"
 		return 1
@@ -999,11 +1168,22 @@ cmd_render() {
 
 	preflight
 
+	# Resolve the instance's saves/mods dirs first: detect_version's alias
+	# arm (via resolve_edition) already reads the resolved mods dir, and
+	# select_save/prepare_sandbox consume the globals below.
+	resolve_instance_dirs
+
 	detect_version
 	info "render: Factorio version ${FACTORIO_VERSION_RESOLVED} (source: ${FACTORIO_VERSION_SOURCE})"
 
 	local edition
-	edition="$(resolve_edition)"
+	if [[ -n "${_FM_EDITION_RESOLVED}" ]]; then
+		# detect_version's alias arm already resolved it (see the global's
+		# comment) — reuse instead of re-parsing the mod list and re-logging.
+		edition="${_FM_EDITION_RESOLVED}"
+	else
+		edition="$(resolve_edition)"
+	fi
 
 	local client_bin
 	client_bin="$(ensure_factorio "${FACTORIO_VERSION_RESOLVED}" "${edition}")"
