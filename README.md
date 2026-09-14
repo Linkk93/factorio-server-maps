@@ -15,8 +15,9 @@ Three guarantees, plainly:
 2. **Renders publish atomically.** The public `latest` symlink is swapped
    with a single `rename(2)`; readers never see a missing or half-published
    map, and a failed render leaves the previous one public.
-3. **The result is a public static page.** `https://your-map-host/` always
-   shows the newest render.
+3. **The result is a public static page.** `https://your-map-host/` shows a
+   timeline of all published renders (newest first), each one viewable — an
+   addressable "time travel" history of the map.
 
 ## How it works
 
@@ -31,22 +32,31 @@ Three guarantees, plainly:
   │ render.sh                                    │  read- │                  │
   │  1. detect Factorio version ◀────────────────────────── │ saves/  mods/    │
   │  2. fetch full Factorio client (cached vol)  │  only  │ factorio/        │
-  │  3. build sandbox: client copy + save + mods │        └──────────────────┘
-  │  4. render: Xvfb + Mesa llvmpipe + mapshot   │    (live server keeps running;
-  │  5. publish: rename + atomic symlink swap    │     render is nice/ionice'd)
+  │  3. skip (exit 0) if save unchanged since    │        └──────────────────┘
+  │     last render (sha256 in render-meta.txt)  │    (live server keeps running;
+  │  4. build sandbox: client copy + save + mods │     render is nice/ionice'd)
+  │  5. render: Xvfb + Mesa llvmpipe + mapshot   │
+  │  6. publish: rename + atomic symlink swap    │
+  │  7. prune retention + regenerate timeline    │
   └──────────────────┬───────────────────────────┘
                      ▼
-       /srv/factorio-maps/                    (OUTPUT_DIR_HOST)
-         ├── renders/20260913-043000_<save>/  (RETENTION_COUNT kept)
-         └── latest ──▶ renders/20260913-043000_<save>
-                     │
-                     ▼
-      Caddy (public): https://map.example.com/  →  latest/index.html
+      /srv/factorio-maps/                    (OUTPUT_DIR_HOST)
+        ├── index.html                       (timeline homepage)
+        ├── renders/20260913-043000_<save>/  (RETENTION_COUNT kept)
+        │     └── render-meta.txt            (save name + sha256 → skip)
+        └── latest ──▶ renders/20260913-043000_<save>
+                    │
+                    ▼
+     Caddy (public): https://map.example.com/          → timeline index.html
+                     https://map.example.com/latest/   → newest map
+                     https://map.example.com/renders/… → archived renders
 ```
 
 Output layout: timestamped render dirs (`UTC`, lexicographic = chronological)
-under `renders/`, and a `latest` symlink Caddy serves. Only `latest/` is
-web-reachable — `renders/`, `.staging/` and lock files are not.
+under `renders/`, a `latest` symlink, and a generated `index.html` timeline at
+the root. Public: `/` (timeline), `/latest/` (newest map) and
+`/renders/<ts>_<save>/` (archive) — `.staging/` and the lock file are hidden
+from the file server.
 
 ## Prerequisites
 
@@ -117,7 +127,7 @@ The rest work out of the box; the most interesting knobs:
 | `SAVE_NAME` | *(newest)* | pin a specific save instead of the newest |
 | `INSTANCE_SAVES_DIR` / `INSTANCE_MODS_DIR` | *(auto)* | in-container path overrides for the instance's `saves/` and `mods/` dirs; empty = auto-discovered (AMP nests them at `<instance>/factorio/server/...` in newer layouts; `mods/` is found via its `mod-list.json`) |
 | `RENDER_TIMEOUT_SECS` | `21600` (6 h) | hard cap around the render |
-| `RETENTION_COUNT` | `3` | old renders kept |
+| `RETENTION_COUNT` | `10` | old renders kept (timeline depth ≈ kept × render frequency) |
 | `MIN_FREE_GB` | `10` | pre-flight disk floor; render is skipped below it |
 
 Every variable is documented in `.env.example` — that file is the single
@@ -150,8 +160,9 @@ untouched and keeps running throughout.
 
 When it finishes:
 
-- `/srv/factorio-maps/latest/index.html` is the new map (public once Caddy
-  points at it, below);
+- `/srv/factorio-maps/` holds the new render plus the regenerated timeline:
+  `latest/index.html` is the newest map, `index.html` the timeline homepage
+  linking to every archived render (public once Caddy points at it, below);
 - `docker compose run --rm mapshot check` prints the resolved configuration
   any time.
 
@@ -206,16 +217,21 @@ caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-- The snippet roots the site at `<OUTPUT_DIR_HOST>/latest` — adjust the path
-  in the snippet if you changed `OUTPUT_DIR_HOST`.
-- Everything gets `Cache-Control: no-cache`: URLs are stable but their
-  content changes each render, so browsers revalidate (cheap 304s). JPEG
-  tiles are excluded from compression (they are already compressed).
-- No reload is needed between renders — the atomic symlink swap is picked up
-  per request.
-- An optional, commented block in the snippet shows how to expose versioned
-  `renders/<timestamp>_<save>/` URLs with immutable caching on a separate
-  host, if you ever want old maps addressable.
+- The snippet roots the site at `<OUTPUT_DIR_HOST>` — adjust the path in the
+  snippet if you changed `OUTPUT_DIR_HOST`.
+- `/` serves the generated timeline homepage (`index.html`, rewritten after
+  every render or skip); `/latest/` is the newest map;
+  `/renders/<timestamp>_<save>/index.html` are the archived views — the
+  time-travel history, `RETENTION_COUNT` entries deep.
+- Caching: tile URLs (`d-<hash>/`) are immutable (1 year); everything else is
+  `no-cache`, so browsers revalidate — cheap `304`s, since `latest/` content
+  changes with each render. JPEG tiles are excluded from compression (they
+  are already compressed).
+- The file server hides `.staging/` and `.render.lock`; nothing else under
+  the output dir is sensitive (`render-meta.txt` per render is just save
+  name/hash metadata).
+- No reload is needed between renders — the atomic symlink swap and the
+  timeline rewrite are picked up per request.
 
 ## Tuning for Space Exploration + Krastorio 2
 
@@ -255,8 +271,9 @@ the OS partition of the game server.
   the render sandbox holds a full copy of the Factorio client (~2.5 GB)
   next to the render output. Publishing is a same-filesystem rename, so
   the render itself never temporarily occupies double space.
-- `RETENTION_COUNT` (default 3): old `renders/<ts>_<save>/` dirs are pruned
-  after each successful render.
+- `RETENTION_COUNT` (default 10): old `renders/<ts>_<save>/` dirs are pruned
+  after each successful render; the pruned history is what bounds the
+  timeline depth on the public page.
 - `CLIENT_CACHE_COUNT` (default 2): version-keyed Factorio clients in the
   `factorio-clients` docker volume, pruned newest-by-mtime after successful
   renders. To reclaim their space manually:
@@ -315,6 +332,6 @@ configuration and validates mounts/tools inside the container.
 | `no saves directory found under /instance` | AMP nests server data at `<instance>/factorio/server/saves/` in newer layouts; render.sh auto-discovers all known layouts. If discovery still fails, set `INSTANCE_SAVES_DIR` (and `INSTANCE_MODS_DIR`) in `.env` to the in-container path under `/instance`. |
 | Save-stability error (`still being written ... 120s`) | The newest autosave is <120 s old (live server may be mid-write). Retry, or pin `SAVE_NAME` in `.env`. |
 | Disk-guard error (`only XGB free ... MIN_FREE_GB`) | Free space on the named mount or lower `MIN_FREE_GB` deliberately. Check `df -h`. |
-| Caddy serves 403/404 | Root path mismatch: snippet root must be `<OUTPUT_DIR_HOST>/latest`; check `OUTPUT_DIR_HOST` in `.env`. |
+| Caddy serves 403/404 | Root path mismatch: snippet root must be `<OUTPUT_DIR_HOST>` (not `/latest` — the timeline and archive live at the root); check `OUTPUT_DIR_HOST` in `.env`. |
 | `.env` changes have no effect | Compose reads `.env` from the project directory — run compose commands from the repo root. |
 | Instance dir warning in validate.sh | AMP data root differs on your host — see step 1 of Server setup. |

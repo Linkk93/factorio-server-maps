@@ -11,32 +11,49 @@
 #
 # --- What it serves ----------------------------------------------------------
 #
-# Root is <OUTPUT_DIR_HOST>/latest (default /srv/factorio-maps/latest — the
-# `latest` symlink render.sh swaps atomically after every render). The URL
-# https://map.example.com/ therefore always shows the newest render.
+# Root is <OUTPUT_DIR_HOST> (default /srv/factorio-maps — the OUTPUT_DIR_HOST
+# bind, NOT latest/). Three public surfaces:
+#
+#   /                                 → timeline homepage: a static index.html
+#                                       that render.sh regenerates after every
+#                                       render (and after every skipped one),
+#                                       listing all published renders
+#                                       newest-first
+#   /latest/                          → the newest map (the `latest` symlink
+#                                       render.sh swaps atomically after every
+#                                       render); / shows it too via the
+#                                       "latest" badge on the newest entry
+#   /renders/<timestamp>_<save>/index.html → archived views of older renders
+#                                       (the "time travel" history, depth =
+#                                       RETENTION_COUNT)
 #
 # ADJUST THE ROOT if you changed OUTPUT_DIR_HOST in .env: the path below must
-# be "<OUTPUT_DIR_HOST>/latest".
+# be exactly "<OUTPUT_DIR_HOST>" (not "<OUTPUT_DIR_HOST>/latest" — the
+# timeline and the renders/ archive live one level above latest/).
 #
-# Nothing else under the output directory is web-reachable, because the root
-# is latest/: renders/ (old versions), .staging/ (scratch, wiped after every
-# run), .render.lock and .latest.tmp* are all siblings of latest/ and can
-# never be requested. If you want old renders public too, see the optional
-# block at the bottom.
+# Non-public entries stay hidden via file_server's `hide` rule (exact
+# dotfile/dir names, matched against the base name — sufficient here):
+# .staging/ (per-run scratch, wiped after every run) and .render.lock (flock
+# target). The .latest.tmp.* symlinks from the atomic swap exist only for
+# microseconds and cannot be hidden by exact name (the name carries the PID);
+# render-meta.txt files inside each render dir are harmless metadata that
+# ships with the render.
 #
 # --- Caching -----------------------------------------------------------------
 #
-# Everything except tile data gets Cache-Control "no-cache": URLs under
-# latest/ are stable, but their CONTENT changes completely with every
-# render, so browsers must revalidate. That is cheap — file_server answers
-# conditional requests with Last-Modified-based (not ETag) 304 responses.
-# Never put long max-age on these paths.
+# Two mutually exclusive matchers cover the whole URL space (each request
+# matches exactly one):
 #
-# Exception — tile data under d-<hash>/: every render writes its tiles into
-# one d-<hash>/ directory (hash unique to that render), and a fresh render
-# creates a NEW d-<hash>/ rather than touching old ones. Those URLs are
-# content-frozen even though they sit under latest/, so they are cached
-# aggressively (1 year, immutable). index.html / js stay no-cache.
+# - Everything except tile data gets Cache-Control "no-cache". Under latest/
+#   the CONTENT changes completely with every render, so browsers must
+#   revalidate; the archive pages (/renders/<ts>_<save>/) are actually frozen
+#   once published, but revalidation there is still just cheap Last-Modified
+#   304s — accepted for the simplicity of one matcher scheme.
+# - Exception — tile data under d-<hash>/: every render writes its tiles into
+#   one d-<hash>/ directory (hash unique to that render) and a fresh render
+#   creates a NEW d-<hash>/ rather than touching old ones. Those URLs are
+#   content-frozen everywhere (latest/ AND renders/), so they are cached
+#   aggressively (1 year, immutable). index.html / js stay no-cache.
 #
 # --- Compression ---------------------------------------------------------------
 #
@@ -49,11 +66,13 @@
 #
 # The `latest` symlink is swapped via a single atomic rename(2) after each
 # render; Caddy resolves it per request, so new renders are picked up
-# immediately — NO Caddy reload is needed between renders.
+# immediately — NO Caddy reload is needed between renders. The timeline
+# index.html is rewritten (temp + mv) after every render or skip the same
+# way.
 # ============================================================================
 
 (factorio_maps) {
-	root * /srv/factorio-maps/latest
+	root * /srv/factorio-maps
 
 	encode zstd gzip {
 		match {
@@ -71,7 +90,12 @@
 	@notTiles not path *d-*/*
 	header @notTiles Cache-Control "no-cache"
 
-	file_server
+	file_server {
+		# Exact base names: hides .staging/ and .render.lock in any
+		# directory. (.latest.tmp.* is microseconds-only during the atomic
+		# swap; render-meta.txt is harmless metadata.)
+		hide .staging .render.lock
+	}
 }
 
 # ============================================================================
@@ -95,22 +119,4 @@
 # 4. Validate and reload:
 #      caddy validate --config /etc/caddy/Caddyfile
 #      sudo systemctl reload caddy
-#
-# ============================================================================
-# OPTIONAL: expose versioned renders with immutable caching
-# ============================================================================
-#
-# By default only latest/ is public. If you later want stable, permanently
-# cacheable URLs for old renders (https://map-archive.example.com/
-# <timestamp>_<save>/index.html), uncomment and adapt — this serves the whole
-# renders/ tree on its OWN host, leaving the snippet above untouched:
-#
-#   map-archive.example.com {
-#   	root * /srv/factorio-maps/renders
-#   	file_server
-#   	header Cache-Control "public, max-age=31536000, immutable"
-#   }
-#
-# (Timestamped render directories are content-frozen once published, so
-# immutable caching is safe there — unlike latest/.)
 # ============================================================================

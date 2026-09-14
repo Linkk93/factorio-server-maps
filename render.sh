@@ -6,8 +6,9 @@
 #   check          (default) validate config, print the resolved-value table,
 #                  check container mounts and tool availability
 #   render         run the mapshot render pipeline: lock + preflight guards,
-#                  save selection, sandbox assembly, mapshot invocation,
-#                  atomic publish + retention
+#                  save selection, unchanged-save skip (time travel), sandbox
+#                  assembly, mapshot invocation, atomic publish + retention,
+#                  timeline regeneration
 #   -h | --help    show usage
 #
 # Anything else is passed through verbatim to the mapshot binary, e.g.:
@@ -112,7 +113,7 @@ load_config() {
 	MAPSHOT_MINJPGQUALITY="${MAPSHOT_MINJPGQUALITY:-85}"
 	MAPSHOT_EXTRA_ARGS="${MAPSHOT_EXTRA_ARGS:-}"
 	OUTPUT_DIR_HOST="${OUTPUT_DIR_HOST:-/srv/factorio-maps}"
-	RETENTION_COUNT="${RETENTION_COUNT:-3}"
+	RETENTION_COUNT="${RETENTION_COUNT:-10}"
 	CLIENT_CACHE_COUNT="${CLIENT_CACHE_COUNT:-2}"
 	MIN_FREE_GB="${MIN_FREE_GB:-10}"
 	LP_NUM_THREADS="${LP_NUM_THREADS:-}"
@@ -814,6 +815,11 @@ ensure_factorio() {
 #                                  mapshot datadir AND Factorio install root
 #   /output/renders/<ts>_<save>/   published renders (UTC timestamp, pinned
 #                                  format → lexicographic == chronological)
+#   /output/renders/<ts>_<save>/render-meta.txt   per-render facts (save name,
+#                                  sha256, timestamps) — powers the skip when
+#                                  the save is unchanged between runs
+#   /output/index.html             timeline homepage (regenerated every run,
+#                                  including skipped ones)
 #   /output/latest                 symlink -> renders/<ts>_<save>, atomic swap
 
 # Newest auto-picked save must be at least this old (seconds) before it is
@@ -833,6 +839,17 @@ SANDBOX_CLIENT_RESERVE_GB=3
 # Set there, read by cmd_render so resolve_edition runs exactly once per
 # render. Always '' when no alias was involved.
 _FM_EDITION_RESOLVED=''
+
+# Per-render facts carried into publish_render for render-meta.txt (the
+# metadata behind the unchanged-save skip). Set by cmd_render after save
+# selection / edition resolution; always '' when unavailable — the
+# corresponding meta key is then simply omitted.
+_FM_SAVE_SHA256=''
+_FM_EDITION=''
+# Captured `mapshot version` output, if any run ever captures it. Nothing
+# does today (an extra binary invocation per render is not worth one cosmetic
+# meta field), so the mapshot_version meta key stays omitted.
+_FM_MAPSHOT_VERSION=''
 
 # preflight: concurrency lock, scratch cleanup, disk guards — in that order.
 # The lock fd stays open for the whole process, so the lock is held until
@@ -1046,6 +1063,25 @@ run_render() {
 	"${render_cmd[@]}"
 }
 
+# dump_factorio_diagnostics: called when the mapshot invocation failed. On a
+# hang (e.g. a modal UI dialog under Xvfb — mod errors, edition mismatch,
+# graphics init failure) mapshot's stderr stops mid-flight, but Factorio keeps
+# writing its own log inside the sandbox datadir. Dump its tail to our stderr
+# so the failure is diagnosable without waiting out the timeout, plus the
+# script-output tile count: 0 tiles ≈ still loading mods, many ≈ rendering.
+dump_factorio_diagnostics() {
+	local log="${SANDBOX_DATADIR}/factorio-current.log"
+	local tiles
+	tiles="$(find "${SANDBOX_DATADIR}/script-output" -type f 2>/dev/null | wc -l)"
+	printf 'render.sh: --- factorio-current.log (last 60 lines) ---\n' >&2
+	if [[ -f "${log}" ]]; then
+		tail -n 60 -- "${log}" >&2
+	else
+		printf 'render.sh: NOTE: Factorio never created %s (itself a diagnostic: graphics never initialized / wrong binary)\n' "${log}" >&2
+	fi
+	printf 'render.sh: --- tile progress: %s file(s) under %s/script-output ---\n' "${tiles}" "${SANDBOX_DATADIR}" >&2
+}
+
 # locate_render_output <save-base>: print the produced render directory.
 # Canonical mapshot layout: <datadir>/script-output/mapshot/<save-base>/ —
 # with the sandbox as a full portable client copy, SANDBOX_DATADIR is the
@@ -1076,7 +1112,10 @@ locate_render_output() {
 #   - latest is swapped via a temp-name symlink + mv -Tf — a single
 #     rename(2), no unlink window (unlike ln -sfn); readers never observe a
 #     missing or half-updated `latest`.
-# Prints the published directory on stdout.
+# render-meta.txt (save name, sha256, timestamps — the data the unchanged-save
+# skip compares) is written into the new dir BEFORE the symlink swap, so a
+# published render never lacks metadata. Prints the published directory on
+# stdout.
 publish_render() {
 	local render_dir="${1:?usage: publish_render <render-dir> <save-base>}"
 	local save_base="${2:?usage: publish_render <render-dir> <save-base>}"
@@ -1088,12 +1127,36 @@ publish_render() {
 	mkdir -p -- "${RENDERS_DIR}"
 	mv -- "${render_dir}" "${RENDERS_DIR}/${publish_name}"
 
+	local publish_dir="${RENDERS_DIR}/${publish_name}"
+	local meta="${publish_dir}/render-meta.txt"
+	if ! {
+		printf 'save=%s\n' "${save_base}"
+		printf 'sha256=%s\n' "${_FM_SAVE_SHA256}"
+		printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		if [[ -n "${FACTORIO_VERSION_RESOLVED}" ]]; then
+			printf 'factorio_version=%s\n' "${FACTORIO_VERSION_RESOLVED}"
+		fi
+		if [[ -n "${_FM_EDITION}" ]]; then
+			printf 'edition=%s\n' "${_FM_EDITION}"
+		fi
+		# mapshot_version is omitted unless a captured value exists (see the
+		# _FM_MAPSHOT_VERSION global): the `mapshot version` subcommand is not
+		# worth an extra invocation per render for a cosmetic field.
+		if [[ -n "${_FM_MAPSHOT_VERSION}" ]]; then
+			printf 'mapshot_version=%s\n' "${_FM_MAPSHOT_VERSION}"
+		fi
+	} >"${meta}"; then
+		# Not fatal: a missing/unparsable meta file only means the next run
+		# cannot skip and re-renders once.
+		warn "cannot write ${meta} — the next render will not be able to skip (no skip metadata)"
+	fi
+
 	rm -f -- "${OUTPUT_DIR}"/.latest.tmp.*
 	local tmp_link="${OUTPUT_DIR}/.latest.tmp.$$"
 	ln -s "renders/${publish_name}" "${tmp_link}"
 	mv -Tf -- "${tmp_link}" "${OUTPUT_DIR}/latest"
 
-	printf '%s\n' "${RENDERS_DIR}/${publish_name}"
+	printf '%s\n' "${publish_dir}"
 }
 
 # prune_renders: keep the newest RETENTION_COUNT dirs under renders/, delete
@@ -1105,8 +1168,8 @@ publish_render() {
 prune_renders() {
 	local keep="${RETENTION_COUNT}"
 	if [[ ! "${keep}" =~ ^[0-9]+$ ]]; then
-		warn "RETENTION_COUNT='${keep}' is not a number — using default 3"
-		keep=3
+		warn "RETENTION_COUNT='${keep}' is not a number — using default 10"
+		keep=10
 	fi
 	if (( keep < 1 )); then
 		warn 'RETENTION_COUNT=0 would delete the fresh render — using 1'
@@ -1151,6 +1214,122 @@ prune_renders() {
 		rm -rf -- "${d}"
 	done
 	info "retention: pruned ${#prune_dirs[@]} old render dir(s), kept the newest (RETENTION_COUNT=${keep})"
+}
+
+# render_meta_read <render-dir>: print the sha256 recorded in
+# <render-dir>/render-meta.txt (key=value lines). Empty output when the dir
+# or file is missing or the content is unparsable (e.g. renders made before
+# this metadata existed) — callers must treat empty as "changed save".
+render_meta_read() {
+	local render_dir="${1:?usage: render_meta_read <render-dir>}"
+	local meta="${render_dir}/render-meta.txt"
+	if [[ ! -r "${meta}" ]]; then
+		return 0
+	fi
+	local key val
+	while IFS='=' read -r key val; do
+		if [[ "${key}" == 'sha256' && "${val}" =~ ^[0-9a-f]{64}$ ]]; then
+			printf '%s\n' "${val}"
+			return 0
+		fi
+	done <"${meta}"
+	return 0
+}
+
+# html_escape <string>: print the string escaped for HTML text and attribute
+# contexts. Save names come from filenames and dirnames from timestamps, but
+# both are still dynamic input to a served page — escape everything. sed, not
+# ${var//&/…}: bash 5.2's default patsub_replacement would expand the `&` in
+# the replacement to the matched text (turning `&lt;` into `<lt;`).
+html_escape() {
+	local s="${1:-}"
+	s="$(printf '%s' "${s}" \
+		| sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&#39;/g")"
+	printf '%s\n' "${s}"
+}
+
+# generate_timeline: write <OUTPUT_DIR>/index.html, a small self-contained
+# static page (embedded CSS, dark theme, no external assets, no JS) listing
+# the published renders newest-first: human-readable date, save name, a link
+# to the archived map view (/renders/<dir>/index.html), and a "latest" badge
+# on the newest entry linking to /latest/. Written atomically (temp + mv);
+# Caddy serves the OUTPUT_DIR root, so the links must be absolute. Idempotent
+# and cheap — regenerated after every publish AND after every skip; a failure
+# to write is a warning, never fatal.
+generate_timeline() {
+	local out="${OUTPUT_DIR}/index.html"
+
+	# Only dirs matching the pinned <YYYYMMDD-HHMMSS>_<name> format are listed
+	# (anything else under renders/ is not a render). Glob expansion is sorted
+	# lexicographically, which — with the pinned UTC timestamp format — equals
+	# chronological order; walk it backwards for newest-first.
+	local -a dirs=()
+	local d
+	shopt -s nullglob
+	for d in "${RENDERS_DIR}"/*; do
+		if [[ -d "${d}" && "${d##*/}" =~ ^[0-9]{8}-[0-9]{6}_ ]]; then
+			dirs+=("${d}")
+		fi
+	done
+	shopt -u nullglob
+
+	local count="${#dirs[@]}"
+	local tmp="${out}.tmp.$$"
+	if ! {
+		cat <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Factorio map timeline</title>
+<style>
+	body { background: #16181d; color: #d7dae0; font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+	h1 { font-size: 1.4rem; color: #f0b429; }
+	.meta { color: #7f8790; font-size: 0.85rem; }
+	ul { list-style: none; padding: 0; }
+	li { padding: 0.55rem 0.75rem; border-bottom: 1px solid #2a2e35; }
+	.date { color: #9aa3ad; font-variant-numeric: tabular-nums; }
+	.badge { background: #f0b429; color: #16181d; font-size: 0.75rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 0.6rem; margin-right: 0.4rem; }
+	a { color: #4da3ff; text-decoration: none; }
+	a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>Factorio map timeline</h1>
+EOF
+		printf '<p class="meta">generated %s UTC &middot; %d render(s) &middot; newest first</p>\n' \
+			"$(date -u '+%Y-%m-%d %H:%M:%S')" "${count}"
+		printf '<ul>\n'
+		local i base ts_raw save_name date_human esc_base esc_save esc_date
+		for ((i = count - 1; i >= 0; i--)); do
+			d="${dirs[${i}]}"
+			base="${d##*/}"
+			ts_raw="${base%%_*}"
+			save_name="${base#*_}"
+			date_human="${ts_raw:0:4}-${ts_raw:4:2}-${ts_raw:6:2} ${ts_raw:9:2}:${ts_raw:11:2}:${ts_raw:13:2} UTC"
+			esc_base="$(html_escape "${base}")"
+			esc_save="$(html_escape "${save_name}")"
+			esc_date="$(html_escape "${date_human}")"
+			printf '<li>'
+			if (( i == count - 1 )); then
+				printf '<a class="badge" href="/latest/">latest</a>'
+			fi
+			printf '<span class="date">%s</span> &mdash; %s &middot; <a href="/renders/%s/index.html">view map</a></li>\n' \
+				"${esc_date}" "${esc_save}" "${esc_base}"
+		done
+		printf '</ul>\n</body>\n</html>\n'
+	} >"${tmp}"; then
+		warn "cannot write the timeline page ${tmp} — leaving the previous ${out} in place"
+		rm -f -- "${tmp}"
+		return 0
+	fi
+	if ! mv -f -- "${tmp}" "${out}"; then
+		warn "cannot install the timeline page at ${out} — leaving the previous one in place"
+		rm -f -- "${tmp}"
+		return 0
+	fi
+	info "timeline: wrote ${out} (${count} render(s))"
 }
 
 # render_cleanup: EXIT trap for the render arm — the staging tree never
@@ -1204,6 +1383,49 @@ cmd_render() {
 	save_base="${save_base%.zip}"
 	info "render: selected save '${save_base}'"
 
+	# --- unchanged-save skip ("time travel" guard) --------------------------
+	# The server stops at 0 players and saves when the last player leaves
+	# (autosaves happen only while players are online), so a save that hashes
+	# identically to the currently published one means nothing new to render.
+	# The check runs AFTER the integrity check and BEFORE prepare_sandbox, so
+	# a skip exits before the ~2 GB sandbox client copy. The snapshot copy is
+	# byte-identical to the staged save, so hashing the staged file here is
+	# equivalent. Missing/unparsable previous metadata (renders made before
+	# this feature) counts as changed: one re-render, then the skip works.
+	local save_sha
+	save_sha="$(sha256sum -- "${save_zip}" 2>/dev/null | cut -d' ' -f1 || true)"
+	if [[ -z "${save_sha}" ]]; then
+		warn "cannot hash ${save_zip} (sha256sum failed) — rendering without the unchanged-save skip"
+	fi
+	_FM_SAVE_SHA256="${save_sha}"
+	_FM_EDITION="${edition}"
+
+	local prev_dir=''
+	prev_dir="$(readlink -f -- "${OUTPUT_DIR}/latest" 2>/dev/null || true)"
+	local prev_sha=''
+	local prev_save=''
+	if [[ -n "${prev_dir}" && -d "${prev_dir}" ]]; then
+		prev_sha="$(render_meta_read "${prev_dir}")"
+		prev_save="$(sed -n 's/^save=\(.*\)$/\1/p' "${prev_dir}/render-meta.txt" 2>/dev/null | head -n 1 || true)"
+	fi
+	if [[ -n "${save_sha}" && "${save_sha}" == "${prev_sha}" && -n "${prev_save}" && "${prev_save}" == "${save_base}" ]]; then
+		# Humanize the previous render's timestamp for the log line; keep the
+		# raw dir name as fallback for anything unparseable.
+		local prev_ts prev_ts_h=''
+		prev_ts="$(basename -- "${prev_dir}")"
+		prev_ts="${prev_ts%%_*}"
+		if [[ "${prev_ts}" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+			prev_ts_h="${prev_ts:0:4}-${prev_ts:4:2}-${prev_ts:6:2} ${prev_ts:9:2}:${prev_ts:11:2}:${prev_ts:13:2} UTC"
+		else
+			prev_ts_h="${prev_ts}"
+		fi
+		info "save unchanged since last render (${prev_ts_h}) — skipping (nothing to time-travel to)"
+		# Timeline for consistency (cheap); clean exit 0 — systemd oneshot
+		# must show success, and this skip is a success by design.
+		generate_timeline
+		exit 0
+	fi
+
 	prepare_sandbox "${save_zip}" "${client_bin}"
 
 	# Render with the SANDBOX copy of the client (not the cache binary):
@@ -1214,6 +1436,7 @@ cmd_render() {
 	local rc=0
 	run_render "${save_base}" "${render_bin}" || rc=$?
 	if (( rc != 0 )); then
+		dump_factorio_diagnostics
 		err "mapshot render failed (exit ${rc}) — check the mapshot/factorio log output above"
 		return 1
 	fi
@@ -1233,6 +1456,10 @@ cmd_render() {
 	publish_dir="$(publish_render "${render_dir}" "${save_base}")"
 
 	prune_renders
+
+	# The timeline homepage lists the archive newest-first; regenerate after
+	# every publish (idempotent, cheap) so it always matches renders/.
+	generate_timeline
 
 	local duration
 	duration=$(( $(date +%s) - started_at ))
