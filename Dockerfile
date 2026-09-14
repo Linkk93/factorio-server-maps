@@ -37,6 +37,7 @@ RUN apt-get update \
         xz-utils \
         unzip \
         xvfb \
+        xauth \
         libgl1 \
         libglx-mesa0 \
         libgl1-mesa-dri \
