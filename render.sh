@@ -1362,7 +1362,8 @@ ensure_overlay_js() {
 	if ! cat >"${tmp}" <<'OVERLAY_EOF'
 /* mapshot time-travel overlay — injected into every render's index.html by
  * render.sh (see inject_time_overlay). Fetches /timeline.json and offers a
- * date switcher; which renders it offers is data-driven via the manifest's
+ * date switcher plus a home button back to the timeline; which renders it
+ * offers is data-driven via the manifest's
  * save_filter field (empty = every render of the instance, so autosaves and
  * renames of the same world stay one history; a name = that save only).
  * Switching forwards the live query string (x/y/z/s/layers kept by the
@@ -1403,50 +1404,64 @@ ensure_overlay_js() {
 			}
 
 			var pill = document.createElement("div");
-			pill.title = "Time travel: switch render date (view position is kept)";
 			pill.style.cssText = "position:fixed;left:10px;bottom:10px;z-index:1000;" +
 				"background:#16181d;color:#d7dae0;border:1px solid #2a2e35;border-radius:8px;" +
 				"padding:6px 10px;font:12px/1.4 system-ui,sans-serif;display:flex;gap:6px;" +
 				"align-items:center;box-shadow:0 2px 8px rgba(0,0,0,.4)";
 
-			function button(label, delta) {
-				var b = document.createElement("button");
-				b.textContent = label;
-				b.addEventListener("click", function () { go(cur + delta); });
-				b.style.cssText = "background:none;border:none;color:#4da3ff;" +
-					"cursor:pointer;font-size:15px;padding:0 2px";
-				return b;
+			// Home: back to the timeline. Available regardless of history depth.
+			var home = document.createElement("button");
+			home.title = "Back to the timeline (/)";
+			home.style.cssText = "background:none;border:none;cursor:pointer;" +
+				"padding:0 2px;display:flex;align-items:center";
+			home.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none"' +
+				' stroke="#4da3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+				'<path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13V9.5"/><path d="M10 20v-5h4v5"/></svg>';
+			home.addEventListener("click", function () { location.href = "/"; });
+			pill.appendChild(home);
+
+			// The date switcher only makes sense with more than one render.
+			if (renders.length >= 2) {
+				function button(label, delta) {
+					var b = document.createElement("button");
+					b.textContent = label;
+					b.addEventListener("click", function () { go(cur + delta); });
+					b.style.cssText = "background:none;border:none;color:#4da3ff;" +
+						"cursor:pointer;font-size:15px;padding:0 2px";
+					return b;
+				}
+				var prev = button("\u2039", -1); // ‹
+				var next = button("\u203A", 1);  // ›
+
+				var select = document.createElement("select");
+				select.title = "Jump to render date";
+				select.style.cssText = "background:#16181d;color:#d7dae0;border:1px solid #2a2e35;" +
+					"border-radius:4px;font:inherit;padding:2px 4px;cursor:pointer";
+				renders.forEach(function (e, i) {
+					var opt = document.createElement("option");
+					opt.value = String(i);
+					opt.textContent = e.date + (i === 0 ? " (latest)" : "");
+					if (i === cur) opt.selected = true;
+					select.appendChild(opt);
+				});
+				select.addEventListener("change", function () {
+					go(parseInt(select.value, 10));
+				});
+
+				function refresh() {
+					prev.disabled = cur === 0;
+					next.disabled = cur === renders.length - 1;
+					prev.style.color = prev.disabled ? "#4a5058" : "#4da3ff";
+					next.style.color = next.disabled ? "#4a5058" : "#4da3ff";
+					prev.style.cursor = prev.disabled ? "default" : "pointer";
+					next.style.cursor = next.disabled ? "default" : "pointer";
+				}
+				refresh();
+
+				pill.appendChild(prev);
+				pill.appendChild(select);
+				pill.appendChild(next);
 			}
-			var prev = button("\u2039", -1); // ‹
-			var next = button("\u203A", 1);  // ›
-
-			var select = document.createElement("select");
-			select.style.cssText = "background:#16181d;color:#d7dae0;border:1px solid #2a2e35;" +
-				"border-radius:4px;font:inherit;padding:2px 4px;cursor:pointer";
-			renders.forEach(function (e, i) {
-				var opt = document.createElement("option");
-				opt.value = String(i);
-				opt.textContent = e.date + (i === 0 ? " (latest)" : "");
-				if (i === cur) opt.selected = true;
-				select.appendChild(opt);
-			});
-			select.addEventListener("change", function () {
-				go(parseInt(select.value, 10));
-			});
-
-			function refresh() {
-				prev.disabled = cur === 0;
-				next.disabled = cur === renders.length - 1;
-				prev.style.color = prev.disabled ? "#4a5058" : "#4da3ff";
-				next.style.color = next.disabled ? "#4a5058" : "#4da3ff";
-				prev.style.cursor = prev.disabled ? "default" : "pointer";
-				next.style.cursor = next.disabled ? "default" : "pointer";
-			}
-			refresh();
-
-			pill.appendChild(prev);
-			pill.appendChild(select);
-			pill.appendChild(next);
 			document.body.appendChild(pill);
 		})
 		.catch(function () { /* no manifest / fetch failed: stay hidden */ });
