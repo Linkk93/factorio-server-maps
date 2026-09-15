@@ -25,7 +25,7 @@ FROM debian:bookworm
 # ships a 2.1-capable release. NOTE: GitHub tags carry NO "v" prefix
 # (upstream convention), and the linux-amd64 asset is a single raw binary
 # named "mapshot-linux".
-ARG MAPSHOT_VERSION=0.0.28-2.2
+ARG MAPSHOT_VERSION=0.0.28-2.3
 
 ENV SDL_AUDIODRIVER=dummy \
     LIBGL_ALWAYS_SOFTWARE=1
