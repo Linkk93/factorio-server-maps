@@ -220,8 +220,22 @@ caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
+> **`Caddyfile.mapshot` is deployed outside the container** — `git pull` +
+> `docker compose build` do NOT update the copy in `/etc/caddy/`. Whenever a
+> pull changes that file, re-copy it and reload Caddy:
+> ```bash
+> sudo cp Caddyfile.mapshot /etc/caddy/ && caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+> ```
+> (Historical example: the timeline feature changed the snippet's `root` from
+> `…/latest` to the output root — a stale deployed copy kept serving a bare
+> map at `/` with the timeline, archive and overlay assets unreachable.)
+
 - The snippet roots the site at `<OUTPUT_DIR_HOST>` — adjust the path in the
-  snippet if you changed `OUTPUT_DIR_HOST`.
+  snippet if you changed `OUTPUT_DIR_HOST`. **Do NOT point it at `latest/`
+  or a render dir**: the timeline (`/`), the archive (`/renders/…`), and the
+  overlay assets (`/timeline.json`, `/overlay.js`) live at the output root —
+  a root too deep serves a bare map with no pill and 404s for everything
+  else (see Troubleshooting).
 - `/` serves the generated timeline homepage (`index.html`, rewritten after
   every render or skip); `/latest/` is the newest map;
   `/renders/<timestamp>_<save>/index.html` are the archived views — the
@@ -350,6 +364,7 @@ configuration and validates mounts/tools inside the container.
 | `FACTORIO_VERSION=experimental`/`stable` downloaded a new client | Expected: the aliases re-resolve on every run via the factorio.com latest-releases API, so a new upstream build triggers one fresh download automatically; the superseded client dir is pruned by `CLIENT_CACHE_COUNT`. Pin a concrete version to freeze the client. |
 | `no saves directory found under /instance` | AMP nests server data at `<instance>/factorio/server/saves/` in newer layouts; render.sh auto-discovers all known layouts. If discovery still fails, set `INSTANCE_SAVES_DIR` (and `INSTANCE_MODS_DIR`) in `.env` to the in-container path under `/instance`. |
 | Save-stability error (`still being written ... 120s`) | Only raised when **every** save is <120 s old (server saving unusually often). Normally the newest mid-write autosave is skipped automatically and the previous stable save is rendered (see the `falling back to the next stable save` log line) — players being online never costs a nightly. |
+| Map loads but no timeline at `/`, no pill, `/latest/` + `/renders/` + `/timeline.json` 404 | Caddy's `root` points too deep (at `latest/` or a render dir) instead of the `OUTPUT_DIR_HOST` root. `grep -n "root " /etc/caddy/Caddyfile*` — it must be exactly `root * /srv/factorio-maps` (or your `OUTPUT_DIR_HOST`). `caddy validate` + `systemctl reload caddy`. |
 | Disk-guard error (`only XGB free ... MIN_FREE_GB`) | Free space on the named mount or lower `MIN_FREE_GB` deliberately. Check `df -h`. |
 | Caddy serves 403/404 | Root path mismatch: snippet root must be `<OUTPUT_DIR_HOST>` (not `/latest` — the timeline and archive live at the root); check `OUTPUT_DIR_HOST` in `.env`. |
 | `.env` changes have no effect | Compose reads `.env` from the project directory — run compose commands from the repo root. |

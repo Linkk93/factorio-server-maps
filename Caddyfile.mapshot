@@ -9,6 +9,9 @@
 #   caddy validate --config /etc/caddy/Caddyfile
 #   sudo systemctl reload caddy
 #
+# This file is deployed OUTSIDE the container: after a `git pull` changes it,
+# re-copy it to /etc/caddy/ and reload Caddy — compose build does not touch it.
+#
 # --- What it serves ----------------------------------------------------------
 #
 # Root is <OUTPUT_DIR_HOST> (default /srv/factorio-maps — the OUTPUT_DIR_HOST
