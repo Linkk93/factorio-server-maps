@@ -129,7 +129,7 @@ The rest work out of the box; the most interesting knobs:
 | `SAVE_NAME` | *(newest)* | pin a specific save instead of the newest |
 | `INSTANCE_SAVES_DIR` / `INSTANCE_MODS_DIR` | *(auto)* | in-container path overrides for the instance's `saves/` and `mods/` dirs; empty = auto-discovered (AMP nests them at `<instance>/factorio/server/...` in newer layouts; `mods/` is found via its `mod-list.json`) |
 | `RENDER_TIMEOUT_SECS` | `21600` (6 h) | hard cap around the render |
-| `RETENTION_COUNT` | `10` | old renders kept (timeline depth ≈ kept × render frequency) |
+| `RETENTION_COUNT` | `10` | old renders kept (timeline depth ≈ kept × render frequency); **pinned renders are exempt and don't consume a slot** |
 | `OVERLAY_SAVE_FILTER` | *(all saves)* | empty = the in-map overlay lists every render (one history across autosaves/renames); a save name restricts it |
 | `MIN_FREE_GB` | `10` | pre-flight disk floor; render is skipped below it |
 

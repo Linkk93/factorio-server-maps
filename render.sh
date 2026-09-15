@@ -69,6 +69,10 @@ Usage:
                              mounts and tool availability (default)
   render.sh render           run the mapshot render pipeline (save select ->
                              sandbox -> render -> atomic publish + retention)
+  render.sh pin <dir>        mark a render as pinned ("do not delete"): never
+                             rotated out, does not consume a retention slot
+  render.sh unpin <dir>      remove the pin (subject to rotation again)
+  render.sh pins             list pinned renders
   render.sh -h | --help      this help
   render.sh <args...>        anything else is passed through verbatim to the
                              mapshot binary, e.g. `render.sh version`
@@ -1186,11 +1190,13 @@ publish_render() {
 }
 
 # prune_renders: keep the newest RETENTION_COUNT dirs under renders/, delete
-# the rest. Glob expansion is sorted lexicographically, which — with the
-# pinned UTC timestamp format — equals chronological order, so oldest-first
-# pruning is order-safe. nullglob keeps a missing renders/ dir from pruning
-# garbage; the dir `latest` points at is skipped defensively, so the symlink
-# can never dangle mid-prune.
+# the rest. Pins ("do not delete") are excluded from BOTH counting and
+# pruning: a dir with a `pinned` marker file (see cmd_pin) is never rotated
+# out and does not consume a slot — N slots + P pins = N+P renders before
+# the oldest *unpinned* render rotates. Glob expansion is sorted
+# lexicographically, which — with the pinned UTC timestamp format — equals
+# chronological order, so oldest-first pruning is order-safe; `latest`'s
+# target is additionally protected so the symlink can never dangle mid-prune.
 prune_renders() {
 	local keep="${RETENTION_COUNT}"
 	if [[ ! "${keep}" =~ ^[0-9]+$ ]]; then
@@ -1202,29 +1208,33 @@ prune_renders() {
 		keep=1
 	fi
 
-	local -a dirs=()
-	local d
+	local -a unpinned=()
+	local d pinned_count=0
 	shopt -s nullglob
 	for d in "${RENDERS_DIR}"/*; do
-		if [[ -d "${d}" ]]; then
-			dirs+=("${d}")
+		[[ -d "${d}" ]] || continue
+		if [[ -f "${d}/pinned" ]]; then
+			pinned_count=$((pinned_count + 1))
+		else
+			unpinned+=("${d}")
 		fi
 	done
 	shopt -u nullglob
 
-	local total="${#dirs[@]}"
+	local total="${#unpinned[@]}"
 	if (( total <= keep )); then
-		info "retention: ${total} render dir(s) present, nothing to prune (RETENTION_COUNT=${keep})"
+		info "retention: ${total} unpinned + ${pinned_count} pinned render dir(s), nothing to prune (RETENTION_COUNT=${keep})"
 		return 0
 	fi
 
 	local latest_target=''
 	latest_target="$(readlink -f -- "${OUTPUT_DIR}/latest" 2>/dev/null || true)"
 
+	local prune_count=$(( total - keep ))
 	local -a prune_dirs=()
 	local i
-	for ((i = 0; i < total - keep; i++)); do
-		d="${dirs[${i}]}"
+	for ((i = 0; i < prune_count; i++)); do
+		d="${unpinned[${i}]}"
 		if [[ -n "${latest_target}" && "${d}" -ef "${latest_target}" ]]; then
 			warn "retention: ${d} is the current 'latest' target — skipping"
 			continue
@@ -1232,14 +1242,14 @@ prune_renders() {
 		prune_dirs+=("${d}")
 	done
 	if (( ${#prune_dirs[@]} == 0 )); then
-		info 'retention: nothing to prune'
+		info "retention: nothing to prune (${pinned_count} pinned dir(s) excluded from rotation)"
 		return 0
 	fi
 	for d in "${prune_dirs[@]}"; do
 		info "retention: pruning old render ${d}"
 		rm -rf -- "${d}"
 	done
-	info "retention: pruned ${#prune_dirs[@]} old render dir(s), kept the newest (RETENTION_COUNT=${keep})"
+	info "retention: pruned ${#prune_dirs[@]} old render dir(s), kept the newest (RETENTION_COUNT=${keep}, ${pinned_count} pinned exempt)"
 }
 
 # render_meta_read <render-dir>: print the sha256 recorded in
@@ -1316,16 +1326,20 @@ write_timeline_json() {
 		printf '{"generated":"%s","save_filter":"%s","renders":[' \
 			"$(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
 			"$(json_escape "${OVERLAY_SAVE_FILTER}")"
-		local d base ts_raw save_name date_human first=1
+		local d base ts_raw save_name date_human pin_state first=1
 		while IFS= read -r d; do
 			base="${d##*/}"
 			ts_raw="${base%%_*}"
 			save_name="${base#*_}"
 			date_human="${ts_raw:0:4}-${ts_raw:4:2}-${ts_raw:6:2} ${ts_raw:9:2}:${ts_raw:11:2}:${ts_raw:13:2} UTC"
+			pin_state='false'
+			if [[ -f "${d}/pinned" ]]; then
+				pin_state='true'
+			fi
 			(( first )) || printf ','
 			first=0
-			printf '\n{"dir":"%s","save":"%s","date":"%s"}' \
-				"$(json_escape "${base}")" "$(json_escape "${save_name}")" "$(json_escape "${date_human}")"
+			printf '\n{"dir":"%s","save":"%s","date":"%s","pinned":%s}' \
+				"$(json_escape "${base}")" "$(json_escape "${save_name}")" "$(json_escape "${date_human}")" "${pin_state}"
 		done < <(tac < <(list_render_dirs))
 		printf '\n]}\n'
 	} >"${tmp}"; then
@@ -1519,6 +1533,7 @@ generate_timeline() {
 	li { padding: 0.55rem 0.75rem; border-bottom: 1px solid #2a2e35; }
 	.date { color: #9aa3ad; font-variant-numeric: tabular-nums; }
 	.badge { background: #f0b429; color: #16181d; font-size: 0.75rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 0.6rem; margin-right: 0.4rem; }
+	.pinbadge { background: #2a6e4f; color: #d8f3e3; font-size: 0.75rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 0.6rem; margin-right: 0.4rem; }
 	a { color: #4da3ff; text-decoration: none; }
 	a:hover { text-decoration: underline; }
 </style>
@@ -1543,6 +1558,9 @@ EOF
 			if (( i == 0 )); then
 				printf '<a class="badge" href="/latest/">latest</a>'
 			fi
+			if [[ -f "${d}/pinned" ]]; then
+				printf '<span class="pinbadge">pinned</span> '
+			fi
 			printf '<span class="date">%s</span> &mdash; %s &middot; <a href="/renders/%s/index.html">view map</a></li>\n' \
 				"${esc_date}" "${esc_save}" "${esc_base}"
 		done
@@ -1558,6 +1576,68 @@ EOF
 		return 0
 	fi
 	info "timeline: wrote ${out} (${count} render(s))"
+}
+
+# validate_render_dir_name <name>: a published render dir name must match
+# the pinned <YYYYMMDD-HHMMSS>_<save> format — this is what the pin/unpin
+# CLI accepts and what keeps the marker write inside renders/.
+validate_render_dir_name() {
+	[[ "${1:-}" =~ ^[0-9]{8}-[0-9]{6}_.+ ]]
+}
+
+# cmd_pin <dir-name>: mark a published render as pinned ("do not delete").
+# Pinned renders are excluded from retention rotation AND do not consume a
+# RETENTION_COUNT slot (see prune_renders). The pin is a marker file inside
+# the render dir, so it survives timeline regeneration and travels with the
+# render. Refreshes the timeline layer so the badge shows immediately.
+cmd_pin() {
+	local name="${1:-}"
+	if ! validate_render_dir_name "${name}"; then
+		err "usage: render.sh pin <YYYYMMDD-HHMMSS>_<save-name> (e.g. render.sh pin 20260915-192212_SOLO-k2se)"
+		return 1
+	fi
+	local dir="${RENDERS_DIR}/${name}"
+	if [[ ! -d "${dir}" ]]; then
+		err "${dir}: no such render"
+		return 1
+	fi
+	if ! touch -- "${dir}/pinned"; then
+		err "cannot create ${dir}/pinned"
+		return 1
+	fi
+	info "pinned ${name} — excluded from retention rotation (does not consume a slot)"
+	update_timeline_layer
+}
+
+# cmd_unpin <dir-name>: remove the pin; the render is subject to retention
+# rotation again.
+cmd_unpin() {
+	local name="${1:-}"
+	if ! validate_render_dir_name "${name}"; then
+		err "usage: render.sh unpin <YYYYMMDD-HHMMSS>_<save-name>"
+		return 1
+	fi
+	local dir="${RENDERS_DIR}/${name}"
+	if [[ ! -d "${dir}" ]]; then
+		err "${dir}: no such render"
+		return 1
+	fi
+	if ! rm -f -- "${dir}/pinned"; then
+		err "cannot remove ${dir}/pinned"
+		return 1
+	fi
+	info "unpinned ${name} — subject to retention rotation again"
+	update_timeline_layer
+}
+
+# cmd_pins: list all currently pinned render dir names.
+cmd_pins() {
+	local d
+	while IFS= read -r d; do
+		if [[ -f "${d}/pinned" ]]; then
+			printf '%s\n' "${d##*/}"
+		fi
+	done < <(list_render_dirs)
 }
 
 # update_timeline_layer: the single entry point for everything that must
@@ -1721,6 +1801,11 @@ main() {
 		render)
 			if (( $# > 0 )); then shift; fi
 			cmd_render "$@"
+			;;
+		pin | unpin | pins)
+			local sub="${cmd}"
+			if (( $# > 0 )); then shift; fi
+			"cmd_${sub}" "$@"
 			;;
 		-h | --help)
 			usage
