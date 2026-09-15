@@ -225,6 +225,14 @@ sudo systemctl reload caddy
   every render or skip); `/latest/` is the newest map;
   `/renders/<timestamp>_<save>/index.html` are the archived views — the
   time-travel history, `RETENTION_COUNT` entries deep.
+- **In-map time-travel overlay**: every render page carries a small date
+  switcher (bottom-left, ‹ dropdown ›) fed by `timeline.json`. It lists the
+  retained renders of that save only, and switching jumps to the selected
+  date **keeping the current view** — position, zoom, surface and layer
+  toggles live in the URL and are forwarded verbatim. Renders published
+  before the overlay existed are retrofitted on the next run (injection is
+  idempotent and also happens on skips); a render dir served without the
+  output root (e.g. tarred out) simply shows no overlay.
 - Caching: tile URLs (`d-<hash>/`) are immutable (1 year); everything else is
   `no-cache`, so browsers revalidate — cheap `304`s, since `latest/` content
   changes with each render. JPEG tiles are excluded from compression (they
