@@ -826,7 +826,10 @@ ensure_factorio() {
 
 # Newest auto-picked save must be at least this old (seconds) before it is
 # trusted: a fresher mtime means the live server is probably still writing
-# it. An explicit SAVE_NAME bypasses the pick (but is still zip-checked).
+# it. With players online the server autosaves frequently, so the auto pick
+# walks newest→oldest and takes the first save past this window (a slightly
+# older render beats a failed nightly). An explicit SAVE_NAME bypasses the
+# pick entirely (but is still zip-checked).
 SAVE_STABILITY_SECS=120
 
 # Extra free space demanded on /output beyond MIN_FREE_GB: the render sandbox
@@ -907,9 +910,13 @@ check_free_space() {
 # select_save: choose the save to render; prints the absolute path on stdout,
 # logs to stderr. SAVE_NAME wins (exact file in INSTANCE_SAVES_DIR, ".zip"
 # appended when missing); otherwise the newest *.zip by mtime, ignoring
-# *.tmp.zip (download/save temporaries). The auto pick is only accepted when
-# the file is at least SAVE_STABILITY_SECS old — fail fast otherwise, the
-# live server may still be writing it.
+# *.tmp.zip (download/save temporaries). The auto pick walks newest→oldest
+# and selects the FIRST save at least SAVE_STABILITY_SECS old: with players
+# online the newest file is often a mid-write autosave, and rendering the
+# previous stable save beats failing the run (a failed nightly is a lost
+# night). Only when every save is inside the stability window does the pick
+# fail — the server is then saving more often than the window, which is
+# genuinely pathological and worth an operator's attention.
 select_save() {
 	# Resolved by resolve_instance_dirs (AMP nests saves/ at various depths).
 	local saves_dir="${INSTANCE_SAVES_DIR:?INSTANCE_SAVES_DIR is not resolved — resolve_instance_dirs must run first}"
@@ -927,22 +934,39 @@ select_save() {
 		fi
 		info "save selection: ${selected} (explicit SAVE_NAME)" >&2
 	else
-		local newest=''
-		newest="$(find "${saves_dir}" -maxdepth 1 -type f -name '*.zip' ! -name '*.tmp.zip' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)"
-		if [[ -z "${newest}" ]]; then
+		# All saves newest-first (mtime sort; *.tmp.zip excluded as
+		# download/save temporaries). The "mtime path" pairs are parsed
+		# with read -r m p so paths with spaces survive intact.
+		local -a cand_mtimes=() cand_paths=()
+		local line m p
+		while IFS=' ' read -r m p; do
+			[[ -n "${p}" ]] || continue
+			cand_mtimes+=("${m%%.*}")
+			cand_paths+=("${p}")
+		done < <(find "${saves_dir}" -maxdepth 1 -type f -name '*.zip' ! -name '*.tmp.zip' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+		if (( ${#cand_paths[@]} == 0 )); then
 			err "no *.zip save found in ${saves_dir}" >&2
 			return 1
 		fi
-		local mtime now age
-		mtime="$(stat -c %Y -- "${newest}")"
+
+		local now
 		now="$(date +%s)"
-		age=$((now - mtime))
-		if (( age < SAVE_STABILITY_SECS )); then
-			err "newest save ${newest} appears to be still being written (${age}s old < ${SAVE_STABILITY_SECS}s stability window) — retry shortly or set SAVE_NAME" >&2
+		local i age=''
+		for ((i = 0; i < ${#cand_paths[@]}; i++)); do
+			age=$(( now - cand_mtimes[i] ))
+			if (( age >= SAVE_STABILITY_SECS )); then
+				if (( i > 0 )); then
+					info "newest save $(basename -- "${cand_paths[0]}") is only $(( now - cand_mtimes[0] ))s old (< ${SAVE_STABILITY_SECS}s stability window) — falling back to the next stable save" >&2
+				fi
+				selected="${cand_paths[i]}"
+				info "save selection: ${selected} (newest stable save, mtime ${age}s old, candidate $((i + 1)) of ${#cand_paths[@]})" >&2
+				break
+			fi
+		done
+		if [[ -z "${selected}" ]]; then
+			err "all ${#cand_paths[@]} save(s) in ${saves_dir} are younger than the ${SAVE_STABILITY_SECS}s stability window (newest: $(basename -- "${cand_paths[0]}"), $(( now - cand_mtimes[0] ))s old) — the server is saving unusually often; retry shortly or set SAVE_NAME" >&2
 			return 1
 		fi
-		selected="${newest}"
-		info "save selection: ${selected} (newest stable save, mtime ${age}s old)" >&2
 	fi
 	printf '%s\n' "${selected}"
 }
