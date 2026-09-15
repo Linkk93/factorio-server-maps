@@ -17,11 +17,15 @@ FROM debian:bookworm
 # Pinned mapshot release. Sourced from the Linkk93 fork, NOT upstream
 # Palats/mapshot: upstream's latest (0.0.28, Nov 2025) declares
 # factorio_version "2.0" in mod/info.json and Factorio 2.1 refuses to load
-# such mods; the fork is identical code with that one line bumped to "2.1".
-# Switch the URL back to Palats/mapshot when upstream ships a 2.1-capable
-# release. NOTE: GitHub tags carry NO "v" prefix (upstream convention), and
-# the linux-amd64 asset is a single raw binary named "mapshot-linux".
-ARG MAPSHOT_VERSION=0.0.28-2.1
+# such mods; and Factorio 2.1 changed set_wait_for_screenshots_to_finish
+# behavior so mapshot's done marker was never written (render completed but
+# the CLI waited forever). Fork 0.0.28-2.1 bumps the version declaration;
+# 0.0.28-2.2 replaces the wait with an ntiles.txt plan + tile file-count
+# completion detection. Switch the URL back to Palats/mapshot when upstream
+# ships a 2.1-capable release. NOTE: GitHub tags carry NO "v" prefix
+# (upstream convention), and the linux-amd64 asset is a single raw binary
+# named "mapshot-linux".
+ARG MAPSHOT_VERSION=0.0.28-2.2
 
 ENV SDL_AUDIODRIVER=dummy \
     LIBGL_ALWAYS_SOFTWARE=1
