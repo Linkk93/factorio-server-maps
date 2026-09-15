@@ -1530,7 +1530,7 @@ EOF
 			"$(date -u '+%Y-%m-%d %H:%M:%S')" "${count}"
 		printf '<ul>\n'
 		local i base ts_raw save_name date_human esc_base esc_save esc_date
-		for ((i = count - 1; i >= 0; i--)); do
+		for ((i = 0; i < count; i++)); do
 			d="${dirs[${i}]}"
 			base="${d##*/}"
 			ts_raw="${base%%_*}"
@@ -1540,7 +1540,7 @@ EOF
 			esc_save="$(html_escape "${save_name}")"
 			esc_date="$(html_escape "${date_human}")"
 			printf '<li>'
-			if (( i == count - 1 )); then
+			if (( i == 0 )); then
 				printf '<a class="badge" href="/latest/">latest</a>'
 			fi
 			printf '<span class="date">%s</span> &mdash; %s &middot; <a href="/renders/%s/index.html">view map</a></li>\n' \
