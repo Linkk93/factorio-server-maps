@@ -130,6 +130,7 @@ The rest work out of the box; the most interesting knobs:
 | `INSTANCE_SAVES_DIR` / `INSTANCE_MODS_DIR` | *(auto)* | in-container path overrides for the instance's `saves/` and `mods/` dirs; empty = auto-discovered (AMP nests them at `<instance>/factorio/server/...` in newer layouts; `mods/` is found via its `mod-list.json`) |
 | `RENDER_TIMEOUT_SECS` | `21600` (6 h) | hard cap around the render |
 | `RETENTION_COUNT` | `10` | old renders kept (timeline depth ≈ kept × render frequency) |
+| `OVERLAY_SAVE_FILTER` | *(all saves)* | empty = the in-map overlay lists every render (one history across autosaves/renames); a save name restricts it |
 | `MIN_FREE_GB` | `10` | pre-flight disk floor; render is skipped below it |
 
 Every variable is documented in `.env.example` — that file is the single
@@ -226,13 +227,15 @@ sudo systemctl reload caddy
   `/renders/<timestamp>_<save>/index.html` are the archived views — the
   time-travel history, `RETENTION_COUNT` entries deep.
 - **In-map time-travel overlay**: every render page carries a small date
-  switcher (bottom-left, ‹ dropdown ›) fed by `timeline.json`. It lists the
-  retained renders of that save only, and switching jumps to the selected
-  date **keeping the current view** — position, zoom, surface and layer
-  toggles live in the URL and are forwarded verbatim. Renders published
-  before the overlay existed are retrofitted on the next run (injection is
-  idempotent and also happens on skips); a render dir served without the
-  output root (e.g. tarred out) simply shows no overlay.
+  switcher (bottom-left, ‹ dropdown ›) fed by `timeline.json`. By default it
+  lists **every** render of the instance — autosaves and renames of the same
+  world stay one history (`OVERLAY_SAVE_FILTER=` empty); set
+  `OVERLAY_SAVE_FILTER=<save>` to restrict it to that save. Switching jumps
+  to the selected date **keeping the current view** — position, zoom,
+  surface and layer toggles live in the URL and are forwarded verbatim.
+  Renders published before the overlay existed are retrofitted on the next
+  run (injection is idempotent and also happens on skips); a render dir
+  served without the output root (e.g. tarred out) simply shows no overlay.
 - Caching: tile URLs (`d-<hash>/`) are immutable (1 year); everything else is
   `no-cache`, so browsers revalidate — cheap `304`s, since `latest/` content
   changes with each render. JPEG tiles are excluded from compression (they
